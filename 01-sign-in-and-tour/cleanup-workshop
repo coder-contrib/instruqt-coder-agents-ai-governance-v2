@@ -1,0 +1,4 @@
+#!/bin/bash
+# No-op cleanup for 01-sign-in-and-tour.
+set -uo pipefail
+exit 0

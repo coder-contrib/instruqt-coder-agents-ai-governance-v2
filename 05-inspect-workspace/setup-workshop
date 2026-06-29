@@ -1,0 +1,33 @@
+#!/bin/bash
+# Defensive setup for 04-inspect-workspace: confirm a workspace container exists
+# the learner can open a terminal in; warn (don't abort) if none yet.
+set -uo pipefail
+
+WS=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^coder-' | wc -l)
+LBL=$(docker ps --filter "label=coder.workspace_id" --format '{{.Names}}' 2>/dev/null | wc -l)
+TOTAL=$((WS + LBL))
+if [ "${TOTAL}" -lt 1 ]; then
+  echo "WARNING: no workspace containers detected. The learner may need to provision one via the Coder UI (Challenge 2) before the inspection commands can run." >&2
+else
+  echo "Detected ${TOTAL} potential workspace container(s)."
+fi
+
+# Grant the non-owner learner(s) the read-only 'auditor' site role (per Jason 2026-06-17:
+# applied in EVERY challenge so the learner always holds the read-only auditor seat, e.g.
+# to open Admin settings -> AI Sessions). auditor is read-only and exposes no secrets
+# (provider creds / MCP PAT / OAuth secret are write-only in Coder). Idempotent.
+ADMIN_TOK=$(cat /etc/coder/admin.token 2>/dev/null | tr -d '\r\n')
+if [ -n "${ADMIN_TOK}" ]; then
+  curl -s -H "Coder-Session-Token: ${ADMIN_TOK}" "http://localhost/api/v2/users" 2>/dev/null \
+    | jq -r '.users[]? | select(.username != "admin") | .id' 2>/dev/null \
+    | while read -r MID; do
+        [ -z "${MID}" ] && continue
+        code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
+          "http://localhost/api/v2/users/${MID}/roles" \
+          -H "Coder-Session-Token: ${ADMIN_TOK}" -H "Content-Type: application/json" \
+          -d '{"roles":["auditor"]}' || echo "000")
+        echo "C05: granted auditor to ${MID} (HTTP ${code})"
+      done
+else
+  echo "C05: admin token not found; auditor grant skipped."
+fi

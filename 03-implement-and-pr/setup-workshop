@@ -1,0 +1,46 @@
+#!/bin/bash
+# Defensive setup for 03-implement-and-pr: ensure a feature branch exists so the
+# PR validation has something to attach to even if the learner skipped ahead.
+set -uo pipefail
+
+GITEA_ACCESS_URL="https://workshop-8081-${_SANDBOX_ID}.env.play.instruqt.com"
+LEARNER_USERNAME=$(agent variable get GITEA_USERNAME 2>/dev/null || echo "learner")
+LEARNER_PASSWORD=$(agent variable get GITEA_PASSWORD 2>/dev/null || echo "WorkshopL3arner!")
+
+n=0
+until [ "$n" -ge 30 ]; do
+  code=$(curl -s -o /dev/null -w "%{http_code}" "${GITEA_ACCESS_URL}/" || echo "000")
+  if echo "$code" | grep -qE "^(200|302)$"; then break; fi
+  n=$((n+1)); sleep 3
+done
+
+BRANCHES=$(curl -s -u "${LEARNER_USERNAME}:${LEARNER_PASSWORD}" \
+  "${GITEA_ACCESS_URL}/api/v1/repos/${LEARNER_USERNAME}/memory-card-ai-demo/branches" 2>/dev/null || echo "[]")
+EXTRA=$(echo "${BRANCHES}" | jq -r '[.[] | select(.name != "main" and .name != "master")] | length' 2>/dev/null || echo "0")
+if [ "${EXTRA}" -lt 1 ]; then
+  echo "No feature branch — seeding agent/card-back-diamond defensively."
+  curl -s -X POST "${GITEA_ACCESS_URL}/api/v1/repos/${LEARNER_USERNAME}/memory-card-ai-demo/branches" \
+    -u "${LEARNER_USERNAME}:${LEARNER_PASSWORD}" -H "Content-Type: application/json" \
+    -d '{"new_branch_name": "agent/card-back-diamond", "old_branch_name": "main"}' \
+    >/dev/null 2>&1 || true
+fi
+
+# Grant the non-owner learner(s) the read-only 'auditor' site role (per Jason 2026-06-17:
+# applied in EVERY challenge so the learner always holds the read-only auditor seat, e.g.
+# to open Admin settings -> AI Sessions). auditor is read-only and exposes no secrets
+# (provider creds / MCP PAT / OAuth secret are write-only in Coder). Idempotent.
+ADMIN_TOK=$(cat /etc/coder/admin.token 2>/dev/null | tr -d '\r\n')
+if [ -n "${ADMIN_TOK}" ]; then
+  curl -s -H "Coder-Session-Token: ${ADMIN_TOK}" "http://localhost/api/v2/users" 2>/dev/null \
+    | jq -r '.users[]? | select(.username != "admin") | .id' 2>/dev/null \
+    | while read -r MID; do
+        [ -z "${MID}" ] && continue
+        code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
+          "http://localhost/api/v2/users/${MID}/roles" \
+          -H "Coder-Session-Token: ${ADMIN_TOK}" -H "Content-Type: application/json" \
+          -d '{"roles":["auditor"]}' || echo "000")
+        echo "C03: granted auditor to ${MID} (HTTP ${code})"
+      done
+else
+  echo "C03: admin token not found; auditor grant skipped."
+fi

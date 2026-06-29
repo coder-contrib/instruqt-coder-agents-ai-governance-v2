@@ -1,0 +1,17 @@
+#!/bin/bash
+# Idempotent solve for 04: drop the sentinel into the first workspace container.
+set -uo pipefail
+
+mapfile -t CANDIDATES < <(
+  docker ps --filter "label=coder.workspace_id" --format '{{.Names}}' 2>/dev/null
+  docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^coder-' || true
+)
+mapfile -t CANDIDATES < <(printf '%s\n' "${CANDIDATES[@]}" | awk 'NF' | sort -u)
+
+for c in "${CANDIDATES[@]}"; do
+  if docker exec "$c" touch /tmp/.workshop-inspected 2>/dev/null; then
+    echo "Sentinel written to ${c}"; exit 0
+  fi
+done
+echo "No workspace container available to write sentinel into."
+exit 0

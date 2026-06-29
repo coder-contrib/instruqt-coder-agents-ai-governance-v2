@@ -1,0 +1,17 @@
+#!/bin/bash
+# Idempotent solve for 01. A GitHub device login can't be simulated, so create a
+# placeholder non-admin user via the admin API (satisfies the "someone signed in"
+# check) and best-effort open a no-workspace chat.
+set -uo pipefail
+
+CODER_ACCESS_URL="https://workshop-80-${_SANDBOX_ID}.env.play.instruqt.com"
+TOKEN=$(cat /etc/coder/admin.token 2>/dev/null || echo "")
+[ -z "${TOKEN}" ] && exit 0
+ORG=$(curl -s -H "Coder-Session-Token: ${TOKEN}" "${CODER_ACCESS_URL}/api/v2/organizations" | jq -r '.[0].id // empty')
+[ -z "${ORG}" ] && exit 0
+
+curl -s -X POST "${CODER_ACCESS_URL}/api/v2/users" \
+  -H "Coder-Session-Token: ${TOKEN}" -H "Content-Type: application/json" \
+  -d "$(jq -n --arg org "$ORG" '{email:"skiptest@example.com", username:"skiptest", password:"SkipT3st-Workshop!", name:"Skip Test", login_type:"password", organization_ids:[$org]}')" \
+  >/dev/null 2>&1 || true
+exit 0

@@ -1,0 +1,1049 @@
+#!/bin/bash
+# Track-level setup for coder-agents-ai-governance  (REMEDIATED build — conforms to
+# the approved "Coder Agents & AI Governance — Instruqt Track Build Plan").
+#
+# Stands up the full self-hosted stack on the workshop VM:
+#   Coder control plane v2.34.2 (Agents + AI Gateway / AI Governance, trial-licensed)
+#   Postgres (Coder state + AI Gateway audit tables: aibridge_*)
+#   Gitea (local "GitHub": repo clone + issues + PRs + Actions)
+#   act_runner (Gitea Actions runner, Docker mode — powers the C04 CI challenge)
+#   Grafana (AI Gateway audit dashboard; Infinity plugin + cost table)
+#   Caddy (reverse proxy; strips CSP/XFO for iframe embedding)
+#
+# AUTH: GitHub device-flow login (custom OAuth app) — learners sign in with their own
+#   GitHub identity (real C06 attribution). The first-user is the LOCAL admin/owner
+#   used for provisioning AND to activate the trial (which unlocks the AI Gateway).
+#   Gitea stays on a LOCAL learner account.
+# MODELS: Amazon Bedrock — Claude (native `bedrock` provider) + OpenAI gpt-oss-120b
+#   (`openai-compat` provider → Bedrock's /openai/v1 endpoint w/ a minted Bedrock API
+#   key). No external Anthropic/OpenAI account, no LiteLLM shim.
+#
+# RUNTIME-VERIFY (see MEMORY.md): exact Bedrock model IDs/inference profiles + region
+#   for gpt-oss; short-term Bedrock API-key minting; AI-Gateway provider seed-env
+#   schema; Agents↔Gateway wiring; Coder Agents / MCP registration endpoints; official
+#   Grafana dashboard.json location; spend-cap API; Gitea Actions API for C04. Each
+#   uncertain step falls through with a WARN and prints admin-UI target values so a
+#   presenter can finish in <2 min. Each sandbox is a FRESH deployment, so seeding
+#   providers from env on first boot is the supported once-off path.
+
+set -euxo pipefail
+PS4='+$0[$LINENO]+ '
+
+echo "########## setup-workshop: starting ##########"
+until [ -f /opt/instruqt/bootstrap/host-bootstrap-completed ]; do sleep 1; done
+echo "host-bootstrap-completed sentinel found"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# OS-layer prep
+# ──────────────────────────────────────────────────────────────────────────────
+
+wait_for_dpkg() {
+  while fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock >/dev/null 2>&1; do
+    echo "Waiting for dpkg lock..."; sleep 2
+  done
+}
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
+wait_for_dpkg
+apt-get update -qq
+apt-get install -y -qq jq curl ca-certificates gnupg unzip python3 python3-pip
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+retry_command() { local a=$1; shift; local d=$1; shift; local n=0
+  until "$@"; do n=$((n+1)); [ "$n" -ge "$a" ] && { echo "retry_command: '$*' failed after ${a}"; return 1; }
+    echo "retry_command attempt $n failed; sleep ${d}s"; sleep "$d"; d=$((d*2)); done; }
+
+wait_http() { local url=$1; local rx=${2:-"^(200|302|401|403)$"}; local a=${3:-60}; local d=${4:-3}; local n=0
+  while [ "$n" -lt "$a" ]; do local c; c=$(curl -s -o /dev/null -w "%{http_code}" "$url" || echo "000")
+    echo "$c" | grep -qE "$rx" && { echo "wait_http: $url -> $c"; return 0; }; n=$((n+1)); sleep "$d"; done
+  echo "wait_http: $url no ${rx} after ${a} attempts" >&2; return 1; }
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Install Docker + Compose v2
+# ──────────────────────────────────────────────────────────────────────────────
+
+if ! command -v docker >/dev/null 2>&1; then
+  install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  chmod a+r /etc/apt/keyrings/docker.gpg
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" > /etc/apt/sources.list.d/docker.list
+  wait_for_dpkg; apt-get update -qq
+  apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  systemctl enable --now docker
+fi
+docker --version; docker compose version
+DOCKER_GID=$(stat -c %g /var/run/docker.sock)
+echo "Docker socket GID: ${DOCKER_GID}"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Resolve injected credentials + model/region config
+# ──────────────────────────────────────────────────────────────────────────────
+
+set +x  # SECURITY: stop xtrace so secrets (AWS keys, Bedrock token, GitHub secrets) are NOT echoed to the Instruqt debug log
+AWS_PREFIX="INSTRUQT_AWS_ACCOUNT_CODER_AGENTS_BEDROCK"
+AWS_ACCESS_KEY_ID_VAL="$(printenv ${AWS_PREFIX}_AWS_ACCESS_KEY_ID || true)"
+AWS_SECRET_ACCESS_KEY_VAL="$(printenv ${AWS_PREFIX}_AWS_SECRET_ACCESS_KEY || true)"
+[ -z "${AWS_ACCESS_KEY_ID_VAL}" ] && echo "WARN: Bedrock AWS creds not found under ${AWS_PREFIX}_* — bedrock provider won't auth."
+
+# Regions: Claude on us-east-1; gpt-oss on us-west-2 (AWS docs example region).
+CLAUDE_REGION="${CLAUDE_REGION:-us-east-1}"
+GPTOSS_REGION="${GPTOSS_REGION:-us-west-2}"
+
+# Bedrock model identifiers.
+# NOTE: Sonnet 4.6's Bedrock inference-profile ID has NO "-vN:0" suffix (unlike 4.5's
+# "...-20250929-v1:0"). Probe 2026-06-14: "us.anthropic.claude-sonnet-4-6-v1:0" →
+# ValidationException (invalid id); "us.anthropic.claude-sonnet-4-6" → AccessDenied(SCP)
+# = the bare form IS a recognized inference profile. Confirm a live "hello" once the org
+# SCP (p-46xnvut5) is lifted; if it then ValidationExceptions, fall back to
+# us.anthropic.claude-sonnet-4-5-20250929-v1:0.
+BEDROCK_SONNET_MODEL="${BEDROCK_SONNET_MODEL:-us.anthropic.claude-sonnet-4-6}"     # default
+BEDROCK_HAIKU_MODEL="${BEDROCK_HAIKU_MODEL:-us.anthropic.claude-haiku-4-5-20251001-v1:0}"
+BEDROCK_GPTOSS_MODEL="${BEDROCK_GPTOSS_MODEL:-openai.gpt-oss-120b-1:0}"
+
+SPEND_CAP_USD_PER_DAY="${SPEND_CAP_USD_PER_DAY:-5}"   # total per-user/day; tuned to measured ~$0.37 full-run spend (~13x headroom)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Mint a short-term Bedrock API key (bearer) for the gpt-oss /openai/v1 path
+# ──────────────────────────────────────────────────────────────────────────────
+# RUNTIME-VERIFY: exact in-sandbox mechanism. Bedrock's OpenAI-compatible endpoint
+# (/openai/v1) accepts ONLY a Bedrock bearer API key, not SigV4. We try the AWS
+# bedrock token generator (short-term key from IAM creds); fall back to a stored
+# long-term key in $BEDROCK_API_KEY if provided.
+BEDROCK_API_KEY_VAL="${BEDROCK_API_KEY:-}"
+if [ -z "${BEDROCK_API_KEY_VAL}" ] && [ -n "${AWS_ACCESS_KEY_ID_VAL}" ]; then
+  pip install --quiet --break-system-packages aws-bedrock-token-generator boto3 2>/dev/null || true
+  BEDROCK_API_KEY_VAL="$(AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID_VAL}" \
+    AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY_VAL}" AWS_REGION="${GPTOSS_REGION}" \
+    python3 - <<'PY' 2>/dev/null || true
+try:
+    from aws_bedrock_token_generator import provide_token
+    print(provide_token(region="us-west-2"))
+except Exception as e:
+    pass
+PY
+)"
+fi
+[ -z "${BEDROCK_API_KEY_VAL}" ] && echo "WARN: could not mint a Bedrock API key — gpt-oss (openai-compat) provider will need a BEDROCK_API_KEY secret. Claude (bedrock provider) is unaffected."
+set -x  # resume xtrace (secrets handled above)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Compute sandbox-public URLs
+# ──────────────────────────────────────────────────────────────────────────────
+
+CODER_ACCESS_URL="https://workshop-80-${_SANDBOX_ID}.env.play.instruqt.com"
+GITEA_ACCESS_URL="https://workshop-8081-${_SANDBOX_ID}.env.play.instruqt.com"
+GRAFANA_ACCESS_URL="https://workshop-3001-${_SANDBOX_ID}.env.play.instruqt.com"
+# Setup-time HTTP runs INSIDE the coder container (it has curl and sits on coder-net),
+# hitting internal service endpoints. This bypasses BOTH failure modes seen in prior
+# runs: the public proxy's high-port routes return 572 during setup, AND the lifecycle
+# script is NOT in the Docker host's network namespace (published-port localhost → 000,
+# curl exit 7). coder→localhost:7080, coder→gitea:3000, coder→grafana:3000 are always
+# reachable. Public *_ACCESS_URL vars stay for the container access URL, Gitea ROOT_URL,
+# learner browser tabs, and [[ Instruqt-Var ]] links.
+CODER_INT="http://localhost:7080"   # coder, from inside the coder container
+GITEA_INT="http://gitea:3000"       # gitea, reachable from coder over coder-net
+GRAFANA_INT="http://grafana:3000"   # grafana, reachable from coder over coder-net
+# cx: run curl inside the coder container. Pipe JSON request bodies via stdin (-d @-).
+cx() { docker compose -f /etc/coder/docker-compose.yml exec -T coder curl "$@"; }
+# wait_in_coder URL ATTEMPTS DELAY — readiness probe issued from inside the coder container.
+wait_in_coder() {
+  local u="$1" a="$2" d="$3" n=0
+  while [ "$n" -lt "$a" ]; do
+    if docker compose -f /etc/coder/docker-compose.yml exec -T coder curl -sf -o /dev/null "$u"; then
+      echo "wait_in_coder: ${u} ready"; return 0; fi
+    n=$((n+1)); sleep "$d"
+  done
+  echo "wait_in_coder: ${u} not ready after ${a} attempts"; return 1
+}
+echo "CODER=${CODER_ACCESS_URL} GITEA=${GITEA_ACCESS_URL} GRAFANA=${GRAFANA_ACCESS_URL}"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Generate stack config files
+# ──────────────────────────────────────────────────────────────────────────────
+
+mkdir -p /etc/coder /etc/coder/grafana/provisioning/datasources \
+         /etc/coder/grafana/provisioning/dashboards /etc/coder/grafana/dashboards
+
+# Caddyfile — three listeners, CSP/XFO stripped.
+cat > /etc/coder/Caddyfile <<'EOF'
+{
+    auto_https off
+}
+:80 {
+    reverse_proxy coder:7080 {
+        header_down -X-Frame-Options
+        header_down -Content-Security-Policy
+    }
+}
+:8081 {
+    reverse_proxy gitea:3000 {
+        header_down -X-Frame-Options
+        header_down -Content-Security-Policy
+        # Transparent Gitea sign-in: present every request as the local 'learner'
+        # account (Gitea reverse-proxy auth). header_up SETS (replaces) the value, so a
+        # client can't spoof a different user through Caddy. Removes the "Sign in" button
+        # and gives the learner write access (Run workflow, open PR) in the embedded tab.
+        header_up X-WEBAUTH-USER learner
+    }
+}
+:3001 {
+    reverse_proxy grafana:3000 {
+        header_down -X-Frame-Options
+        header_down -Content-Security-Policy
+    }
+}
+EOF
+
+# Grafana datasources: Postgres (read-only, aibridge_*) + Infinity (LiteLLM model-pricing
+# JSON for the cost table). Matches plan §3.
+cat > /etc/coder/grafana/provisioning/datasources/datasources.yaml <<'EOF'
+apiVersion: 1
+datasources:
+  # UIDs deliberately match the datasource inputs in Coder's OFFICIAL aibridge
+  # dashboard.json (coder-observability-ro / litellm-pricing-data) so it provisions
+  # with no remapping. The Postgres role stays grafana_ro (read-only).
+  - name: Coder AI Gateway (Postgres)
+    uid: coder-observability-ro
+    type: grafana-postgresql-datasource
+    access: proxy
+    url: postgres:5432
+    user: grafana_ro
+    secureJsonData:
+      password: "grafana_ro_pw"
+    jsonData: { database: coder, sslmode: disable, postgresVersion: 1600 }
+    isDefault: true
+    editable: false
+  - name: Model Pricing (Infinity)
+    uid: litellm-pricing-data
+    type: yesoreyeram-infinity-datasource
+    access: proxy
+    url: https://raw.githubusercontent.com/BerriAI/litellm/refs/heads/main/model_prices_and_context_window.json
+    editable: false
+EOF
+
+cat > /etc/coder/grafana/provisioning/dashboards/dashboards.yaml <<'EOF'
+apiVersion: 1
+providers:
+  - name: AI Gateway
+    orgId: 1
+    folder: ''
+    type: file
+    options: { path: /var/lib/grafana/dashboards }
+EOF
+
+# Coder's OFFICIAL aibridge Grafana dashboard (Build Plan §5: "Coder's official
+# dashboard.json, not a custom build"). Source: coder/coder
+#   examples/monitoring/dashboards/grafana/aibridge/dashboard.json
+# Pinned to the reviewed blob (sha 25ec3ba...) via the GitHub blobs API; falls back to
+# main, then to a minimal embedded dashboard so the tab is never empty.
+# It's an EXPORTED dashboard (uses ${DS_*} template inputs), so we (1) resolve the two
+# datasource placeholders to our provisioned UIDs, (2) drop the import-only
+# __inputs/__elements/__requires, and (3) force a stable uid + branded title so the
+# Grafana tab deep-link (/d/coder-ai-gateway) and the C06 nav copy stay correct.
+DASH_RAW="/etc/coder/grafana/dashboards/.ai-gateway.raw.json"
+DASH_OUT="/etc/coder/grafana/dashboards/ai-gateway.json"
+DASH_SRCS=(
+  "blob|https://api.github.com/repos/coder/coder/git/blobs/25ec3ba167215accecdc6bc30de1887836c0ec8b"
+  "raw|https://raw.githubusercontent.com/coder/coder/main/examples/monitoring/dashboards/grafana/aibridge/dashboard.json"
+)
+DASH_OK=""
+for entry in "${DASH_SRCS[@]}"; do
+  kind="${entry%%|*}"; url="${entry#*|}"
+  if [ "$kind" = "blob" ]; then
+    curl -fsSL -H "Accept: application/vnd.github.raw" "$url" -o "$DASH_RAW" 2>/dev/null || continue
+  else
+    curl -fsSL "$url" -o "$DASH_RAW" 2>/dev/null || continue
+  fi
+  jq -e . "$DASH_RAW" >/dev/null 2>&1 || continue
+  # Resolve the exported template datasource placeholders -> our provisioned UIDs.
+  sed -i 's/\${DS_CODER-OBSERVABILITY-RO}/coder-observability-ro/g; s/\${DS_LITELLM-PRICING-DATA}/litellm-pricing-data/g' "$DASH_RAW"
+  if jq 'del(.__inputs, .__elements, .__requires) | .id=null | .uid="coder-ai-gateway" | .title="Coder AI Gateway — Audit & Attribution"' \
+        "$DASH_RAW" > "$DASH_OUT" 2>/dev/null; then
+    echo "Official aibridge dashboard provisioned (source: $kind)."; DASH_OK=1; rm -f "$DASH_RAW"; break
+  fi
+done
+if [ -z "${DASH_OK}" ]; then
+  echo "WARN: official aibridge dashboard not fetched — using embedded fallback."
+  cat > "$DASH_OUT" <<'EOF'
+{ "title": "Coder AI Gateway — Audit & Attribution", "uid": "coder-ai-gateway", "schemaVersion": 39, "version": 1,
+  "time": {"from":"now-7d","to":"now"}, "refresh": "1m", "panels": [
+   {"type":"stat","title":"Total intercepted requests","gridPos":{"h":6,"w":8,"x":0,"y":0},
+    "datasource":{"type":"grafana-postgresql-datasource","uid":"coder-observability-ro"},
+    "targets":[{"rawSql":"SELECT count(*) AS value FROM aibridge_interceptions;","format":"table","refId":"A"}]},
+   {"type":"table","title":"Requests by user","gridPos":{"h":10,"w":16,"x":8,"y":0},
+    "datasource":{"type":"grafana-postgresql-datasource","uid":"coder-observability-ro"},
+    "targets":[{"rawSql":"SELECT u.username AS user, count(*) AS requests FROM aibridge_interceptions i JOIN users u ON i.initiator_id = u.id GROUP BY u.username ORDER BY requests DESC;","format":"table","refId":"A"}]},
+   {"type":"timeseries","title":"Interceptions over time","gridPos":{"h":8,"w":24,"x":0,"y":10},
+    "datasource":{"type":"grafana-postgresql-datasource","uid":"coder-observability-ro"},
+    "targets":[{"rawSql":"SELECT date_trunc('minute', started_at) AS time, count(*) AS interceptions FROM aibridge_interceptions WHERE $__timeFilter(started_at) GROUP BY 1 ORDER BY 1;","format":"time_series","refId":"A"}]}
+  ]}
+EOF
+fi
+
+# Gitea act_runner registration token is minted AFTER Gitea is up (see below); the
+# runner reads it from /etc/coder/.env. Seed a placeholder so the first compose-up
+# doesn't choke; we recreate act_runner once the real token exists.
+echo "GITEA_RUNNER_TOKEN=pending" > /etc/coder/.env
+
+# Docker Compose stack.
+cat > /etc/coder/docker-compose.yml <<EOF
+networks: { coder-net: { driver: bridge, name: coder-net } }
+volumes: { postgres-data: {}, gitea-data: {}, coder-data: {}, grafana-data: {} }
+services:
+  postgres:
+    image: postgres:16
+    environment: { POSTGRES_USER: coder, POSTGRES_PASSWORD: coder, POSTGRES_DB: coder }
+    volumes: [ "postgres-data:/var/lib/postgresql/data" ]
+    networks: [coder-net]
+    restart: unless-stopped
+
+  coder:
+    image: ghcr.io/coder/coder:v2.34.2
+    depends_on: [postgres]
+    environment:
+      CODER_PG_CONNECTION_URL: postgresql://coder:coder@postgres/coder?sslmode=disable
+      CODER_HTTP_ADDRESS: 0.0.0.0:7080
+      CODER_ACCESS_URL: ${CODER_ACCESS_URL}
+      CODER_WILDCARD_ACCESS_URL: ""
+      # Telemetry ON: the trial/AI-Governance license REQUIRES telemetry — with it
+      # disabled the UI shows "License requires telemetry but telemetry is disabled"
+      # and the Coder Agents entitlement appears degraded (model dropdown stays empty).
+      CODER_TELEMETRY_ENABLE: "true"
+      CODER_OAUTH2_GITHUB_DEFAULT_PROVIDER_ENABLE: "false"
+      # ── AWS creds for the native bedrock provider (Claude) ──
+      AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID_VAL}"
+      AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY_VAL}"
+      AWS_DEFAULT_REGION: "${CLAUDE_REGION}"
+      AWS_REGION: "${CLAUDE_REGION}"
+      # ── AI Gateway (aibridge) ──────────────────────────────────────────────
+      # Correct namespace is CODER_AIBRIDGE_* (NOT CODER_AI_GATEWAY_*, which is the
+      # deprecated DB-seed namespace that fails the boot). The gateway MUST be
+      # explicitly enabled. NOTE: these env vars only PRE-SEED the DB on first boot
+      # (deprecated, ignored after upgrades). The Claude provider is created via the
+      # REST API below as TYPE=bedrock — env-seeding Bedrock as TYPE=anthropic does
+      # NOT surface its models in the Agents chat dropdown (confirmed 2026-06-15).
+      # Indices contiguous from 0; each NAME unique.
+      CODER_AIBRIDGE_ENABLED: "true"
+      # Provider 0: gpt-oss via Bedrock's OpenAI-compatible endpoint. TYPE=openai
+      # takes KEY (the minted Bedrock bearer token) + BASE_URL. Model picked per-request.
+      CODER_AIBRIDGE_PROVIDER_0_TYPE: "openai"
+      CODER_AIBRIDGE_PROVIDER_0_NAME: "bedrock-gptoss"
+      CODER_AIBRIDGE_PROVIDER_0_KEY: "${BEDROCK_API_KEY_VAL}"
+      CODER_AIBRIDGE_PROVIDER_0_BASE_URL: "https://bedrock-runtime.${GPTOSS_REGION}.amazonaws.com/openai/v1"
+    volumes:
+      - "coder-data:/home/coder/.config"
+      - "/var/run/docker.sock:/var/run/docker.sock"
+    group_add: [ "${DOCKER_GID}" ]
+    networks: [coder-net]
+    restart: unless-stopped
+
+  gitea:
+    image: gitea/gitea:latest
+    environment:
+      USER_UID: "1000"
+      USER_GID: "1000"
+      GITEA__server__ROOT_URL: ${GITEA_ACCESS_URL}/
+      GITEA__server__DOMAIN: workshop
+      GITEA__server__DISABLE_SSH: "true"
+      GITEA__security__INSTALL_LOCK: "true"
+      GITEA__service__DISABLE_REGISTRATION: "true"
+      GITEA__service__REQUIRE_SIGNIN_VIEW: "false"
+      # Transparent sign-in: trust the X-WEBAUTH-USER header Caddy injects and log every
+      # request in as that local account (the 'learner' user). No "Sign in" button; the
+      # embedded Gitea tab is always authenticated with write access.
+      GITEA__service__ENABLE_REVERSE_PROXY_AUTHENTICATION: "true"
+      GITEA__service__ENABLE_REVERSE_PROXY_AUTHENTICATION_API: "true"
+      # Gitea only honors the auth header from a trusted proxy. Gitea is reachable ONLY
+      # via Caddy (its port isn't published), so trust the sandbox's internal network.
+      GITEA__security__REVERSE_PROXY_TRUSTED_PROXIES: "*"
+      GITEA__actions__ENABLED: "true"
+      GITEA__database__DB_TYPE: sqlite3
+      GITEA__database__PATH: /data/gitea/gitea.db
+    volumes: [ "gitea-data:/data" ]
+    networks: [coder-net]
+    restart: unless-stopped
+
+  act_runner:
+    image: gitea/act_runner:latest
+    depends_on: [gitea]
+    environment:
+      GITEA_INSTANCE_URL: "http://gitea:3000"
+      GITEA_RUNNER_REGISTRATION_TOKEN: "\${GITEA_RUNNER_TOKEN}"
+      GITEA_RUNNER_NAME: "workshop-runner"
+      CONFIG_FILE: "/config.yaml"
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock"
+      - "/etc/coder/act_runner.yaml:/config.yaml:ro"
+    networks: [coder-net]
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      GF_INSTALL_PLUGINS: "yesoreyeram-infinity-datasource"
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Viewer"
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_SECURITY_ALLOW_EMBEDDING: "true"
+      GF_USERS_DEFAULT_THEME: "dark"
+    volumes:
+      - "grafana-data:/var/lib/grafana"
+      - "/etc/coder/grafana/provisioning:/etc/grafana/provisioning:ro"
+      - "/etc/coder/grafana/dashboards:/var/lib/grafana/dashboards:ro"
+    networks: [coder-net]
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2
+    depends_on: [coder, gitea, grafana]
+    volumes: [ "/etc/coder/Caddyfile:/etc/caddy/Caddyfile:ro" ]
+    ports: [ "80:80", "8081:8081", "3001:3001" ]
+    networks: [coder-net]
+    restart: unless-stopped
+EOF
+
+# act_runner config: attach Actions job containers to coder-net so the CI job
+# (C04) can resolve "coder:7080". Without this, jobs land on an ephemeral per-job
+# network and can't reach the control plane. Also map host.docker.internal as a
+# fallback. Must exist as a FILE before the first `docker compose up` (bind mount).
+cat > /etc/coder/act_runner.yaml <<'EOF'
+container:
+  network: "coder-net"
+  options: "--add-host=host.docker.internal:host-gateway"
+  valid_volumes: []
+  force_pull: false
+EOF
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Pre-pull images in parallel (incl. act_runner + workspace base)
+# ──────────────────────────────────────────────────────────────────────────────
+echo "Pre-pulling images..."
+for img in postgres:16 ghcr.io/coder/coder:v2.34.2 gitea/gitea:latest gitea/act_runner:latest \
+           grafana/grafana:latest caddy:2 codercom/enterprise-base:ubuntu; do
+  docker pull "$img" & done
+wait
+echo "All images pulled."
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Bring up the stack (act_runner will keep restarting until its token is set)
+# ──────────────────────────────────────────────────────────────────────────────
+cd /etc/coder
+docker compose up -d
+echo "Stack starting..."
+wait_in_coder "${CODER_INT}/healthz" 120 4 || echo "WARN: Coder readiness gate timed out; continuing — provisioning steps will surface real errors."
+wait_in_coder "${GITEA_INT}/" 90 3 || echo "WARN: Gitea readiness gate timed out; continuing."
+wait_in_coder "${GRAFANA_INT}/api/health" 60 3 || true
+echo "--- coder logs (tail 40) ---"; docker compose logs --tail=40 coder 2>&1 || true
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Coder: first admin (TRIAL — unlocks AI Gateway), per the prospect's scaffolding
+# ──────────────────────────────────────────────────────────────────────────────
+CODER_ADMIN_EMAIL="admin@example.com"
+CODER_ADMIN_USERNAME="admin"
+CODER_ADMIN_PASSWORD="CoderAdmin-$(date +%s | tail -c 6)!aA"
+
+CODER_USER_EMAIL="${INSTRUQT_USER_EMAIL-user@example.com}"
+CODER_USER_PASSWORD="CoderUser-$(date +%s | tail -c 6)!aA"
+
+# Sanitize an arbitrary string into a valid Coder username.
+sanitize_username() {
+  local raw="$1"
+  # 1. Strip email domain
+  local s="${raw%@*}"
+  # 2. Replace runs of invalid characters with a single hyphen
+  s=$(echo "$s" | sed -E 's/[^a-zA-Z0-9-]+/-/g')
+  # 3. Collapse multiple hyphens
+  s=$(echo "$s" | sed -E 's/-+/-/g')
+  # 4. Trim leading/trailing hyphens
+  s="${s#-}"
+  s="${s%-}"
+  # 5. Truncate to 32 chars (and re-trim trailing hyphen if truncation left one)
+  s="${s:0:32}"
+  s="${s%-}"
+  # 6. Fallback if empty
+  if [ -z "$s" ]; then
+    s="user-$(head -c 4 /dev/urandom | base64 | tr -d '=' | tr '[:upper:]' '[:lower:]')"
+  fi
+  echo "$s"
+}
+
+CODER_USER_USERNAME=$(sanitize_username "${CODER_USER_EMAIL}")
+echo "Sanitized username: ${CODER_USER_USERNAME}"
+
+FIRST_USER_BODY=$(jq -n --arg email "$CODER_ADMIN_EMAIL" --arg username "$CODER_ADMIN_USERNAME" --arg password "$CODER_ADMIN_PASSWORD" \
+  '{email: $email, username: $username, name: "Admin User", password: $password, trial: true,
+    trial_info: {first_name: "Admin", last_name: "User", phone_number: "555-555-5555",
+                 job_title: "Platform Engineer", company_name: "Example Corp", country: "US", developers: "1-50"}}')
+FIRST_USER_RESP=$(printf '%s' "$FIRST_USER_BODY" | cx -s -X POST "${CODER_INT}/api/v2/users/first" -H "Content-Type: application/json" -d @-)
+echo "first-user response: ${FIRST_USER_RESP}" | head -c 300; echo
+
+LOGIN_BODY=$(jq -n --arg email "$CODER_ADMIN_EMAIL" --arg pw "$CODER_ADMIN_PASSWORD" '{email: $email, password: $pw}')
+LOGIN_RESP=$(printf '%s' "$LOGIN_BODY" | cx -s -X POST "${CODER_INT}/api/v2/users/login" -H "Content-Type: application/json" -d @-)
+CODER_ADMIN_TOKEN=$(echo "$LOGIN_RESP" | jq -r '.session_token')
+if [ -z "$CODER_ADMIN_TOKEN" ] || [ "$CODER_ADMIN_TOKEN" = "null" ]; then
+  echo "FATAL: no admin session token. ${LOGIN_RESP}" >&2; exit 1; fi
+echo "Coder admin token obtained."
+
+ORG_RESP=$(cx -s -H "Coder-Session-Token: ${CODER_ADMIN_TOKEN}" "${CODER_INT}/api/v2/organizations")
+DEFAULT_ORG_ID=$(echo "$ORG_RESP" | jq -r '.[0].id // empty')
+[ -z "$DEFAULT_ORG_ID" ] && { echo "FATAL: no default org. ${ORG_RESP}" >&2; exit 1; }
+echo "Org ID: ${DEFAULT_ORG_ID}"
+
+# Create user
+CODER_USER_RESP=$(cx -sS -w $'\n%{http_code}' -X POST "${CODER_INT}/api/v2/users" \
+  -H "Coder-Session-Token: ${CODER_ADMIN_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"email\": \"${CODER_USER_EMAIL}\",
+    \"username\": \"${CODER_USER_USERNAME}\",
+    \"password\": \"${CODER_USER_PASSWORD}\",
+    \"login_type\": \"password\",
+    \"organization_ids\": [\"${DEFAULT_ORG_ID}\"]
+  }")
+CODER_USER_HTTP=$(echo "${CODER_USER_RESP}" | tail -n1)
+CODER_USER_BODY=$(echo "${CODER_USER_RESP}" | sed '$d')
+
+if [ "${CODER_USER_HTTP}" != "201" ]; then
+  echo "Failed to create user (HTTP ${CODER_USER_HTTP}): ${CODER_USER_BODY}" >&2
+  exit 1
+fi
+
+CODER_USER_ID=$(echo "${CODER_USER_BODY}" | jq -r '.id // empty')
+if [ -z "${CODER_USER_ID}" ]; then
+  echo "User creation returned 201 but no id in response: ${CODER_USER_BODY}" >&2
+  exit 1
+fi
+echo "Created user ${CODER_USER_USERNAME} (${CODER_USER_ID})"
+
+# Create token
+TOKEN_NAME="token-$(head -c 6 /dev/urandom | base64 | tr -d '=' | tr '[:upper:]' '[:lower:]')"
+CODER_TOKEN_RESP=$(cx -sS -w $'\n%{http_code}' -X POST "${CODER_INT}/api/v2/users/${CODER_USER_USERNAME}/keys/tokens" \
+  -H "Coder-Session-Token: ${CODER_ADMIN_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"lifetime\": "7200000000000",
+    \"token_name\": \"${TOKEN_NAME}\",
+    \"scope\": \"all\"
+  }")
+CODER_TOKEN_HTTP=$(echo "${CODER_TOKEN_RESP}" | tail -n1)
+CODER_TOKEN_BODY=$(echo "${CODER_TOKEN_RESP}" | sed '$d')
+
+if [ "${CODER_TOKEN_HTTP}" != "201" ]; then
+  echo "Failed to create token for ${CODER_USER_USERNAME} (HTTP ${CODER_TOKEN_HTTP}): ${CODER_TOKEN_BODY}" >&2
+  exit 1
+fi
+
+CODER_USER_TOKEN=$(echo "${CODER_TOKEN_BODY}" | jq -r '.key // empty')
+if [ -z "${CODER_USER_TOKEN}" ]; then
+  echo "Token creation returned 201 but no key in response: ${CODER_TOKEN_BODY}" >&2
+  exit 1
+fi
+echo "Created token ${TOKEN_NAME} for ${CODER_USER_USERNAME}"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Admin-UI fallback target values (printed for the presenter if any automation slips)
+# ──────────────────────────────────────────────────────────────────────────────
+cat <<DIAGEOF
+=== Coder Agents / AI Gateway config targets (admin-UI fallback) ===
+  GitHub login:   custom OAuth app (device flow); ALLOW_EVERYONE; signups on
+  AI Gateway providers (Admin → AI → Providers, or /ai/settings):
+    - Bedrock (type=bedrock): region ${CLAUDE_REGION}; model ${BEDROCK_SONNET_MODEL}; small/fast ${BEDROCK_HAIKU_MODEL}; AWS access key/secret in settings
+    - OpenAI-compatible:    base URL https://bedrock-runtime.${GPTOSS_REGION}.amazonaws.com/openai/v1 ; model ${BEDROCK_GPTOSS_MODEL}; Bedrock API key (bearer)
+  Coder Agents models:  ${BEDROCK_SONNET_MODEL} (default) + ${BEDROCK_HAIKU_MODEL} + ${BEDROCK_GPTOSS_MODEL}
+  Spend cap (advisory): ${SPEND_CAP_USD_PER_DAY} USD/user/day  — UI-only, NOT auto-enforced; needs per-model pricing too (see NOTE). Monitor via Grafana + AWS.
+  GitHub MCP:       Manage Agents → MCP Servers → https://api.githubcopilot.com/mcp/  (PAT bearer)
+  Learner role:     Coder Agents User + Auditor (read-only)  (auto-granted to each GitHub user via systemd reconciler + C01 check)
+====================================================================
+DIAGEOF
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Coder Agents (v2.34) model wiring — ENTIRELY BEST-EFFORT. errexit + pipefail are
+# DISABLED for this whole block so a 4xx, a wrong-schema body, or a truncated-response
+# SIGPIPE can NEVER abort setup (a prior run died exit 255 exactly this way). Every
+# call's HTTP code + full body is logged for diagnosis (no `head` truncation).
+#
+# CONFIRMED 2026-06-15 (with Coder's team): the Claude provider MUST be created as
+# TYPE=bedrock via the REST API (POST /api/v2/ai/providers). A TYPE=anthropic provider
+# with bedrock settings does NOT surface its models in the Agents chat dropdown. Required
+# fields: type, name, base_url, enabled, settings{_type:"bedrock",_version:1,model,
+# small_fast_model,region,access_key,access_key_secret}. gpt-oss stays env-seeded
+# (TYPE=openai) and is resolved by name. model-configs POST returns 201.
+# ──────────────────────────────────────────────────────────────────────────────
+set +e +o pipefail
+
+# (a) Create the Claude provider as TYPE=bedrock via REST (the only shape the Agents
+#     dropdown surfaces). base_url + settings._type discriminator are both required.
+set +x
+echo "POST bedrock provider (TYPE=bedrock):"
+jq -n --arg bu "https://bedrock-runtime.${CLAUDE_REGION}.amazonaws.com" \
+      --arg m "${BEDROCK_SONNET_MODEL}" --arg sf "${BEDROCK_HAIKU_MODEL}" --arg r "${CLAUDE_REGION}" \
+      --arg ak "${AWS_ACCESS_KEY_ID_VAL}" --arg as "${AWS_SECRET_ACCESS_KEY_VAL}" \
+      '{type:"bedrock", name:"bedrock-claude", display_name:"AWS Bedrock (Claude)", enabled:true, base_url:$bu, settings:{_type:"bedrock", _version:1, base_url:$bu, model:$m, small_fast_model:$sf, region:$r, access_key:$ak, access_key_secret:$as}}' \
+  | cx -s -w "\nHTTP %{http_code}\n" -X POST "${CODER_INT}/api/v2/ai/providers" \
+      -H "Coder-Session-Token: ${CODER_ADMIN_TOKEN}" -H "Content-Type: application/json" -d @- 2>&1
+set -x
+
+# Resolve provider ids: Claude (just-created bedrock provider) + gpt-oss (env-seeded), both by name.
+PROVIDERS_JSON=$(cx -s -H "Coder-Session-Token: ${CODER_ADMIN_TOKEN}" "${CODER_INT}/api/v2/ai/providers")
+CLAUDE_PID=$(echo "$PROVIDERS_JSON" | jq -r '.[]|select(.name=="bedrock-claude")|.id // empty')
+GPTOSS_PID=$(echo "$PROVIDERS_JSON" | jq -r '.[]|select(.name=="bedrock-gptoss")|.id // empty')
+echo "Agents providers: claude=${CLAUDE_PID:-none} gptoss=${GPTOSS_PID:-none}"
+
+# (b) Create model-configs (the chat's dropdown list). Confirmed 201 last run.
+add_model() {  # $1 provider_id  $2 model_id  $3 display  $4 is_default(true/false)
+  [ -z "$1" ] && { echo "skip model ${2} (no provider id)"; return 0; }
+  echo "model-config ${3} (${2}):"
+  jq -n --arg pid "$1" --arg m "$2" --arg d "$3" --argjson def "$4" \
+    '{ai_provider_id:$pid, model:$m, display_name:$d, enabled:true, is_default:$def, context_limit:200000}' \
+    | cx -s -w "\nHTTP %{http_code}\n" -X POST "${CODER_INT}/api/experimental/chats/model-configs" \
+        -H "Coder-Session-Token: ${CODER_ADMIN_TOKEN}" -H "Content-Type: application/json" -d @- 2>&1
+}
+add_model "${CLAUDE_PID}" "${BEDROCK_SONNET_MODEL}" "Claude Sonnet 4.6"   true
+add_model "${CLAUDE_PID}" "${BEDROCK_HAIKU_MODEL}"  "Claude Haiku 4.5"    false
+add_model "${GPTOSS_PID}" "${BEDROCK_GPTOSS_MODEL}" "OpenAI gpt-oss-120b" false
+
+# GitHub MCP server. Schema confirmed from Coder source codersdk/mcp.go
+# (CreateMCPServerConfigRequest) on 2026-06-14, corroborated field-for-field by the live
+# v2.34.x API: transport one of {streamable_http, sse}; auth_type one of {none, oauth2,
+# api_key, custom_headers, user_oidc}; availability one of {force_on, default_on,
+# default_off}; the PAT
+# is passed via api_key_header + api_key_value (NOT a `headers` map). Prior 400s were
+# transport:"streamable-http" (hyphen) + auth_type:"bearer" + headers — all invalid.
+# SECURITY: disable xtrace BEFORE referencing the PAT. The 'if [ -n "$PAT" ]' condition test
+# is itself traced and prints the expanded token, so set +x MUST precede the if, not follow then.
+set +x
+
+set -x
+set -e -o pipefail
+# NOTE — spend cap is ADVISORY, NOT auto-enforced (decision 2026-06-17, grounded in
+# Coder docs: ai-coder/agents/platform-controls/usage-insights). Coder exposes NO API/CLI
+# to set the spend limit — it is UI-only: Agents > Settings > Manage Agents > Spend
+# (enable; Period=day; Default limit=${SPEND_CAP_USD_PER_DAY}). Enforcement ALSO requires
+# per-model input/output pricing (Agents > Settings > Manage Agents > Models) for EVERY
+# enabled Bedrock model; until BOTH are set, Coder's limit fail-opens for Bedrock. For these
+# ephemeral sandboxes (no per-play admin) we rely on MONITORING instead — the Grafana cost
+# table (LiteLLM pricing) + AWS billing — and enable only the 3 approved models.
+# (AI Gateway rate/concurrency controls are request throttles, not dollar caps.)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Custom workspace template (Docker; Node 22; repo pre-clone from in-sandbox Gitea)
+# ──────────────────────────────────────────────────────────────────────────────
+mkdir -p /etc/coder/workspace-template
+cat > /etc/coder/workspace-template/main.tf <<'TFTEMPLATE'
+terraform {
+  required_providers {
+    coder  = { source = "coder/coder" }
+    docker = { source = "kreuzwerker/docker" }
+  }
+}
+variable "docker_socket" {
+  default = ""
+  type    = string
+}
+provider "docker" {
+  host = var.docker_socket != "" ? var.docker_socket : null
+}
+data "coder_provisioner" "me" {}
+data "coder_workspace" "me" {}
+data "coder_workspace_owner" "me" {}
+resource "coder_agent" "main" {
+  arch = data.coder_provisioner.me.arch
+  os   = "linux"
+  startup_script_behavior = "blocking"
+  startup_script = <<-EOT
+    set -e
+    if [ ! -f ~/.init_done ]; then cp -rT /etc/skel ~ 2>/dev/null || true; touch ~/.init_done; fi
+    if ! command -v node >/dev/null 2>&1 || [ "$(node --version 2>/dev/null | cut -d. -f1)" != "v22" ]; then
+      curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -; sudo apt-get install -y nodejs; fi
+    if [ ! -d /home/coder/memory-card-ai-demo ]; then
+      cd /home/coder
+      git clone http://learner:WorkshopL3arner!@host.docker.internal:8081/learner/memory-card-ai-demo.git; fi
+    cd /home/coder/memory-card-ai-demo
+    git config --global user.name "${coalesce(data.coder_workspace_owner.me.name, data.coder_workspace_owner.me.full_name)}"
+    git config --global user.email "${data.coder_workspace_owner.me.email}"
+    if grep -q 'rolldown-vite' package.json; then sed -i 's/"npm:rolldown-vite@7\.1\.14"/"^5.0.4"/g' package.json; fi
+    if [ ! -d node_modules ]; then npm install --no-audit --no-fund; fi
+    # App Preview: allow the Instruqt sandbox host in Vite, hide that tweak from git so it
+    # never lands in the agent's PR, then start the Vite dev server (5173) in the background
+    # so the published port serves the live working tree.
+    perl -0777 -pi -e 's/allowedHosts:\s*\[[^\]]*\]/allowedHosts: true/s' vite.config.js 2>/dev/null || true
+    git update-index --assume-unchanged vite.config.js 2>/dev/null || true
+    if ! curl -fsS http://localhost:5173 >/dev/null 2>&1; then nohup npm run dev > /tmp/vite-dev.log 2>&1 & fi
+    touch /home/coder/.workspace-ready
+    if [ ! -f /etc/profile.d/workshop-cwd.sh ]; then
+      echo 'cd /home/coder/memory-card-ai-demo 2>/dev/null || true' | sudo tee /etc/profile.d/workshop-cwd.sh >/dev/null
+      sudo chmod +x /etc/profile.d/workshop-cwd.sh; fi
+    echo "Workspace ready: Node $(node --version)."
+  EOT
+  env = {
+    GIT_AUTHOR_NAME     = coalesce(data.coder_workspace_owner.me.name, data.coder_workspace_owner.me.full_name)
+    GIT_AUTHOR_EMAIL    = data.coder_workspace_owner.me.email
+    GIT_COMMITTER_NAME  = coalesce(data.coder_workspace_owner.me.name, data.coder_workspace_owner.me.full_name)
+    GIT_COMMITTER_EMAIL = data.coder_workspace_owner.me.email
+  }
+}
+module "code-server" {
+  source   = "registry.coder.com/coder/code-server/coder"
+  version  = "~> 1.0"
+  agent_id = coder_agent.main.id
+}
+resource "docker_volume" "home_volume" {
+  name = "coder-${data.coder_workspace.me.id}-home"
+  lifecycle { ignore_changes = all }
+}
+resource "docker_container" "workspace" {
+  count    = data.coder_workspace.me.start_count
+  image    = "codercom/enterprise-base:ubuntu"
+  name     = "coder-${data.coder_workspace_owner.me.name}-${lower(data.coder_workspace.me.name)}"
+  hostname = data.coder_workspace.me.name
+  command  = ["sh", "-c", replace(coder_agent.main.init_script, "/localhost|127\\.0\\.0\\.1/", "host.docker.internal")]
+  env      = ["CODER_AGENT_TOKEN=${coder_agent.main.token}"]
+  host {
+    host = "host.docker.internal"
+    ip   = "host-gateway"
+  }
+  volumes {
+    container_path = "/home/coder/"
+    volume_name    = docker_volume.home_volume.name
+    read_only      = false
+  }
+  # App Preview: publish the in-workspace Vite dev server (5173) to the VM host so an
+  # Instruqt service tab can reach it. ONLY the learner's (non-admin) workspace publishes
+  # it: the C04 CI-triggered agent runs as 'admin' and must NOT also bind host:5173, or the
+  # two workspaces collide on the fixed port and the CI workspace fails to start (no PR).
+  dynamic "ports" {
+    for_each = data.coder_workspace_owner.me.name == "admin" ? [] : [1]
+    content {
+      internal = 5173
+      external = 5173
+      ip       = "0.0.0.0"
+    }
+  }
+}
+TFTEMPLATE
+
+if docker compose -f /etc/coder/docker-compose.yml exec -T -u 0 coder coder login "http://localhost:7080" --token "${CODER_ADMIN_TOKEN}" \
+   && docker compose -f /etc/coder/docker-compose.yml exec -T -u 0 coder bash -c 'rm -rf /tmp/docker-template && mkdir -p /tmp/docker-template' \
+   && docker cp /etc/coder/workspace-template/main.tf "$(docker compose -f /etc/coder/docker-compose.yml ps -q coder)":/tmp/docker-template/main.tf \
+   && docker compose -f /etc/coder/docker-compose.yml exec -T -u 0 coder bash -c 'cd /tmp/docker-template && coder templates push docker --yes --directory .'; then
+  echo "Workspace template registered: docker"
+else
+  echo "WARN: workspace template push failed; admin can retry from Templates UI." >&2
+fi
+
+# Mint a dedicated Coder token for the C04 CI workflow (headless Agents API calls).
+CI_TOKEN_RESP=$(printf '%s' '{"token_name":"ci-agent-token","scope":"all"}' \
+  | cx -s -X POST "${CODER_INT}/api/v2/users/me/keys/tokens" \
+      -H "Coder-Session-Token: ${CODER_ADMIN_TOKEN}" -H "Content-Type: application/json" -d @-)
+CODER_CI_TOKEN=$(echo "$CI_TOKEN_RESP" | jq -r '.key // empty')
+[ -z "${CODER_CI_TOKEN}" ] && { CODER_CI_TOKEN="${CODER_ADMIN_TOKEN}"; echo "WARN: dedicated CI token mint failed; using admin token for CI."; }
+
+# ──────────────────────────────────────────────────────────────────────────────
+# agents-access reconciler — systemd service (survives challenge transitions)
+# ──────────────────────────────────────────────────────────────────────────────
+# Grants the built-in 'agents-access' (Coder Agents User) role to EVERY non-admin
+# (GitHub-authed) user that lacks it, so the Agents UI + model dropdown appear with
+# NO manual grant. This is exactly the design the Build Plan specifies ("a reconciler
+# from setup-workshop that waits for the first non-admin user to appear and grants
+# them agents-access").
+#
+# NOTE: the read-only 'auditor' SITE role (needed ONLY for C06's AI Sessions view) is
+# granted later, in 06-ai-gateway-and-grafana/setup-workshop — least-privilege, so the
+# learner has NO admin-settings visibility during C01-C05 and steps into the read-only
+# auditor seat exactly when C06 needs it. (auditor exposes no secrets: provider creds /
+# MCP PAT / OAuth secret are write-only in Coder and never returned, even to owner.) Empirically (2026-06-14) agents-access alone surfaces the
+# model dropdown — chat:read is sufficient; no broader role is needed (and Coder
+# forbids custom org roles from carrying these org_member perms anyway: HTTP 400
+# "organization scoped roles may not contain organization member permissions").
+#
+# Why systemd, not nohup: the old nohup poller (a) timed out after ~20 min and
+# (b) did not survive Instruqt challenge transitions, so a learner who signed in
+# late got no grant and had to run it manually. A systemd service with Restart=always
+# loops indefinitely and catches the login whenever it happens. A per-user state file
+# means each user is granted exactly once (no redundant PUTs, no log spam).
+cat > /usr/local/bin/agents-access-reconciler.sh <<RECEOF
+#!/bin/bash
+ORG="${DEFAULT_ORG_ID}"
+COMPOSE="/etc/coder/docker-compose.yml"
+STATE="/var/lib/agents-access-granted"
+touch "\${STATE}"
+ccurl() { docker compose -f "\${COMPOSE}" exec -T coder curl -s "\$@"; }
+while true; do
+  TOKEN="\$(cat /etc/coder/admin.token 2>/dev/null)"
+  if [ -n "\${TOKEN}" ]; then
+    ccurl -H "Coder-Session-Token: \${TOKEN}" "http://localhost:7080/api/v2/users" \
+      | jq -r '.users[]? | select(.username != "admin") | .id' 2>/dev/null \
+      | while read -r MEMBER_ID; do
+          [ -z "\${MEMBER_ID}" ] && continue
+          grep -qxF "\${MEMBER_ID}" "\${STATE}" && continue
+          CODE=\$(printf '%s' '{"roles": ["agents-access"]}' \
+            | ccurl -o /dev/null -w "%{http_code}" \
+                -X PUT "http://localhost:7080/api/v2/organizations/\${ORG}/members/\${MEMBER_ID}/roles" \
+                -H "Coder-Session-Token: \${TOKEN}" -H "Content-Type: application/json" -d @-)
+          # Also grant the read-only 'auditor' SITE role (unlocks Admin settings -> AI
+          # Sessions). Same post-sign-in timing as agents-access, so it lives here too: a
+          # per-challenge setup grant can't fire in C01 (setup runs before the learner logs in).
+          ACODE=\$(printf '%s' '{"roles": ["auditor"]}' \
+            | ccurl -o /dev/null -w "%{http_code}" \
+                -X PUT "http://localhost:7080/api/v2/users/\${MEMBER_ID}/roles" \
+                -H "Coder-Session-Token: \${TOKEN}" -H "Content-Type: application/json" -d @-)
+          if [[ "\${CODE}" == 2* ]] && [[ "\${ACODE}" == 2* ]]; then
+            echo "\${MEMBER_ID}" >> "\${STATE}"
+            echo "granted agents-access + auditor to \${MEMBER_ID} (org \${CODE} / site \${ACODE})"
+          else
+            echo "grant for \${MEMBER_ID} returned org \${CODE} / site \${ACODE} (will retry)"
+          fi
+        done
+  fi
+  sleep 5
+done
+RECEOF
+chmod +x /usr/local/bin/agents-access-reconciler.sh
+
+cat > /etc/systemd/system/agents-access-reconciler.service <<'UNITEOF'
+[Unit]
+Description=Coder agents-access role reconciler (auto-grant to GitHub learners)
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/local/bin/agents-access-reconciler.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNITEOF
+
+systemctl daemon-reload
+systemctl enable --now agents-access-reconciler.service
+echo "agents-access reconciler (systemd) enabled."
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Postgres: read-only role for Grafana
+# ──────────────────────────────────────────────────────────────────────────────
+docker compose -f /etc/coder/docker-compose.yml exec -T postgres \
+  psql -U coder -d coder -v ON_ERROR_STOP=0 <<'PSQL' || echo "WARN: grafana_ro provisioning had non-fatal errors."
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='grafana_ro') THEN CREATE ROLE grafana_ro LOGIN PASSWORD 'grafana_ro_pw'; END IF;
+END $$;
+GRANT CONNECT ON DATABASE coder TO grafana_ro;
+GRANT USAGE ON SCHEMA public TO grafana_ro;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO grafana_ro;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO grafana_ro;
+PSQL
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Gitea: admin + learner, clone repo, seed 5 issues, wire Actions + runner
+# ──────────────────────────────────────────────────────────────────────────────
+GITEA_ADMIN_USERNAME="gitadmin"
+GITEA_ADMIN_PASSWORD="GiteaAdmin-$(date +%s | tail -c 6)!aA"
+GITEA_ADMIN_EMAIL="gitadmin@coder.local"
+LEARNER_USERNAME="learner"; LEARNER_PASSWORD="WorkshopL3arner!"; LEARNER_EMAIL="learner@coder.local"
+
+docker compose exec -T -u git gitea gitea admin user create --username "${GITEA_ADMIN_USERNAME}" --password "${GITEA_ADMIN_PASSWORD}" --email "${GITEA_ADMIN_EMAIL}" --admin --must-change-password=false
+docker compose exec -T -u git gitea gitea admin user create --username "${LEARNER_USERNAME}" --password "${LEARNER_PASSWORD}" --email "${LEARNER_EMAIL}" --must-change-password=false
+
+printf '%s' '{"clone_addr":"https://github.com/coder-contrib/memory-card-ai-demo.git","repo_owner":"'"${LEARNER_USERNAME}"'","repo_name":"memory-card-ai-demo","mirror":false,"private":false,"description":"Memory Card Game — workshop repository"}' \
+  | cx -s -X POST "${GITEA_INT}/api/v1/repos/migrate" -u "${LEARNER_USERNAME}:${LEARNER_PASSWORD}" -H "Content-Type: application/json" -d @- | head -c 200; echo
+
+# Prune the migrated repo down to its default branch only. The migrate pulls coder-contrib's
+# full branch set (claude-code/*, coder-fix/*, fix/issue-*, etc.); dropping them keeps the
+# repo clean so the learner's/agent's branch is the ONLY non-main branch.
+GREPO="${GITEA_INT}/api/v1/repos/${LEARNER_USERNAME}/memory-card-ai-demo"
+# The migrate populates refs ASYNCHRONOUSLY — wait until the branch count is STABLE across two
+# consecutive reads before pruning, otherwise we'd delete only 'main' and the rest arrive after.
+prev=-1; stable=0
+for i in $(seq 1 40); do
+  cnt=$(cx -s "${GREPO}/branches?limit=100" -u "${LEARNER_USERNAME}:${LEARNER_PASSWORD}" 2>/dev/null | jq -r 'if type=="array" then length else 0 end' 2>/dev/null || echo 0)
+  if [ "${cnt}" -ge 1 ] && [ "${cnt}" -eq "${prev}" ]; then stable=$((stable+1)); else stable=0; fi
+  [ "${stable}" -ge 2 ] && break
+  prev="${cnt}"; sleep 3
+done
+DEFAULT_BRANCH=$(cx -s "${GREPO}" -u "${LEARNER_USERNAME}:${LEARNER_PASSWORD}" 2>/dev/null | jq -r '.default_branch // "main"')
+# Branch names contain slashes (claude-code/..., fix/...). The slash MUST be percent-encoded
+# (/ → %2F) or Gitea's DELETE /branches/{branch} route 404s and the branch silently survives.
+# Read the branch list into an ARRAY first. Piping into `while read` and calling `cx` (which is
+# `docker compose exec ... curl`) in the loop body fails: exec drains the loop's stdin, so only
+# the FIRST branch ever gets deleted. Iterating an array sidesteps that; </dev/null on the DELETE
+# is belt-and-suspenders.
+readarray -t PRUNE_BRANCHES < <(cx -s "${GREPO}/branches?limit=100" -u "${LEARNER_USERNAME}:${LEARNER_PASSWORD}" 2>/dev/null \
+  | jq -r --arg d "${DEFAULT_BRANCH}" '.[]?.name | select(. != $d)')
+for b in "${PRUNE_BRANCHES[@]}"; do
+  [ -z "$b" ] && continue
+  enc=$(printf '%s' "$b" | sed 's,/,%2F,g')
+  cx -s -o /dev/null -X DELETE "${GREPO}/branches/${enc}" -u "${LEARNER_USERNAME}:${LEARNER_PASSWORD}" </dev/null || true
+done
+REMAIN=$(cx -s "${GREPO}/branches?limit=100" -u "${LEARNER_USERNAME}:${LEARNER_PASSWORD}" 2>/dev/null | jq -r '[.[]?.name] | join(",")')
+echo "Branch prune complete. Remaining: ${REMAIN:-<none>} (default=${DEFAULT_BRANCH})"
+# Snapshot the post-seed branch set as the C02 baseline. The C02 check passes ONLY when a branch
+# exists BEYOND this baseline — so the check is honest even if a stray inherited branch lingers.
+mkdir -p /etc/coder
+cx -s "${GREPO}/branches?limit=100" -u "${LEARNER_USERNAME}:${LEARNER_PASSWORD}" 2>/dev/null \
+  | jq -r '.[]?.name' | sort -u > /etc/coder/c02-branch-baseline.txt || true
+echo "C02 branch baseline: $(tr '\n' ' ' < /etc/coder/c02-branch-baseline.txt)"
+
+create_issue() { printf '%s' "$(jq -n --arg t "$1" --arg b "$2" '{title:$t, body:$b}')" \
+  | cx -s -X POST "${GITEA_INT}/api/v1/repos/${LEARNER_USERNAME}/memory-card-ai-demo/issues" \
+      -u "${LEARNER_USERNAME}:${LEARNER_PASSWORD}" -H "Content-Type: application/json" -d @- >/dev/null; }
+create_issue "Change the card back design" $'**Goal:** add a visible red diamond to the back face of each card; it disappears when a card is flipped face-up and reappears on a no-match flip-back.\n\n**Difficulty:** Easy (good first issue)'
+create_issue "Add difficulty levels (4x4, 6x6, 8x8)" $'**Goal:** let the player pick a grid size before each game (Easy 4x4 / Medium 6x6 / Hard 8x8); grid + symbols scale; show current difficulty.\n\n**Difficulty:** Advanced'
+create_issue "Implement high score persistence" $'**Goal:** track and persist the best score (fewest moves) across sessions; games-played counter increments.\n\n**Difficulty:** Intermediate'
+create_issue "Create a theme selector" $'**Goal:** let the player pick a card-symbol theme (Animals, Emoji, Flags) before the game starts.\n\n**Difficulty:** Intermediate'
+create_issue "Add a countdown timer" $'**Goal:** introduce a 60-second countdown lose condition with a "Time\'s Up!" modal; pauses on win, resets on reset.\n\n**Difficulty:** Intermediate'
+
+# Append Gitea branch/PR guidance to the repo's AGENTS.md so the agent does its git work in the
+# WORKSPACE against Gitea (origin), and opens PRs in Gitea — NOT on GitHub. The GitHub MCP is
+# read-only (writes denied), so this is the agent's instruction set for where writes go.
+AGENTS_JSON=$(cx -s "${GREPO}/contents/AGENTS.md" -u "${LEARNER_USERNAME}:${LEARNER_PASSWORD}" 2>/dev/null)
+AGENTS_SHA=$(echo "$AGENTS_JSON" | jq -r '.sha // empty')
+if [ -n "$AGENTS_SHA" ]; then
+  AGENTS_CUR=$(echo "$AGENTS_JSON" | jq -r '.content' | base64 -d 2>/dev/null)
+  AGENTS_GUIDE=$(cat <<'AGEOF'
+
+## How to do git work in this environment (REQUIRED)
+
+This repository's git host is **Gitea**, not GitHub. Your Coder workspace has it pre-cloned at
+`/home/coder/memory-card-ai-demo` with the Gitea `origin` remote and credentials already set.
+
+1. If no workspace is attached to this chat, **create one** and do all work inside it.
+2. Implement the change, commit, and push your feature branch to Gitea: `git push -u origin <branch>`.
+3. Open the pull request **in Gitea** (never on GitHub). Derive the base URL + credentials from the
+   origin remote, then call the Gitea pulls API:
+       REMOTE=$(git remote get-url origin)     # http://user:pass@host:8081/learner/memory-card-ai-demo.git
+       BASE=${REMOTE%/learner/*}                # http://user:pass@host:8081
+       curl -X POST -H "Content-Type: application/json" \
+         -d '{"head":"<branch>","base":"main","title":"<title>","body":"<summary>"}' \
+         "$BASE/api/v1/repos/learner/memory-card-ai-demo/pulls"
+
+Do NOT create branches or pull requests on GitHub. All branches and PRs must live in Gitea.
+AGEOF
+)
+  AGENTS_NEW_B64=$(printf '%s\n%s' "$AGENTS_CUR" "$AGENTS_GUIDE" | base64 -w0)
+  jq -n --arg c "$AGENTS_NEW_B64" --arg s "$AGENTS_SHA" '{message:"Add Gitea workspace + PR guidance for agents", content:$c, sha:$s, branch:"main"}' \
+    | cx -s -o /dev/null -X PUT "${GREPO}/contents/AGENTS.md" -u "${LEARNER_USERNAME}:${LEARNER_PASSWORD}" -H "Content-Type: application/json" -d @- \
+    && echo "AGENTS.md updated with Gitea PR guidance." || echo "WARN: AGENTS.md guidance update failed (non-fatal)."
+else
+  echo "WARN: AGENTS.md not found in repo; skipped Gitea guidance injection."
+fi
+
+# Seed the CI workflow into the repo (used by C04). Calls the Coder Agents API.
+# Use a quoted heredoc to prevent shell expansion of ${{ }} GitHub Actions syntax,
+# then selectively substitute only the three env vars via envsubst.
+WF_TEMPLATE=$(cat <<'WFEOF'
+name: coder-agent
+on:
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: "Prompt for the Coder Agent"
+        required: true
+        default: "Clone the ${GITEA_ACCESS_URL}/${LEARNER_USERNAME}/memory-card-ai-demo.git repo and implement the 'Change the card back design' issue. Add a visible red diamond to the back face of every card that disappears when the card is flipped face-up. Create a feature branch named ci/card-back-design, commit your change, push the branch to origin, and open a pull request into main."
+jobs:
+  trigger-agent:
+    runs-on: ubuntu-latest
+    env:
+      CODER_URL: ${CODER_ACCESS_URL}
+      CODER_TARGET_USER_UUID: ${CODER_USER_ID}
+      CODER_SESSION_TOKEN: ${{ secrets.CODER_SESSION_TOKEN }}
+      CODER_ORG_ID: ${{ secrets.CODER_ORG_ID }}
+      PROMPT: ${{ github.event.inputs.prompt }}
+    steps:
+      - name: Trigger the Coder Agent
+        id: trigger
+        run: |
+          echo "POST ${CODER_URL}/api/experimental/chats (org ${CODER_ORG_ID})"
+          ESC=${PROMPT//\\/\\\\}
+          ESC=${ESC//\"/\\\"}
+          RESPONSE=$(curl -sS -X POST "${CODER_URL}/api/experimental/chats" \
+            -H "Coder-Session-Token: ${CODER_SESSION_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{\"organization_id\":\"${CODER_ORG_ID}\",\"content\":[{\"type\":\"text\",\"text\":\"${ESC}\"}]}")
+
+          CHAT_ID=$(echo "${RESPONSE}" | jq -r '.id')
+          CHAT_URL="${CODER_URL}/agents/${CHAT_ID}"
+
+          CHAT_ACL_RESP=$(curl -sS -w $'\n%{http_code}' -X PATCH \
+            "${CODER_URL}/api/experimental/chats/${CHAT_ID}/acl" \
+            -H "Coder-Session-Token: ${CODER_SESSION_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{\"user_roles\": {\"${CODER_TARGET_USER_UUID}\": \"read\"}}")
+          CHAT_ACL_HTTP=$(echo "${CHAT_ACL_RESP}" | tail -n1)
+          CHAT_ACL_BODY=$(echo "${CHAT_ACL_RESP}" | sed '$d')
+
+          if [ "${CHAT_ACL_HTTP}" != "204" ]; then
+            echo "Failed to share chat ${CHAT_ID} with ${TARGET_USER} (HTTP ${CHAT_ACL_HTTP}): ${CHAT_ACL_BODY}" >&2
+            exit 1
+          fi
+
+          echo "Shared chat ${CHAT_ID} with ${TARGET_USER} (read)"
+
+          echo "Chat created: ${CHAT_URL}"
+          echo "chat_url=${CHAT_URL}" >> "${GITHUB_OUTPUT}"
+
+      - name: Show chat URL
+        run: echo "Chat URL is ${{ steps.trigger.outputs.chat_url }}"
+
+      - name: Add to job summary
+        run: |
+          echo "### Coder Agent" >> "${GITHUB_STEP_SUMMARY}"
+          echo "Chat: [${{ steps.trigger.outputs.chat_url }}](${{ steps.trigger.outputs.chat_url }})" >> "${GITHUB_STEP_SUMMARY}"
+WFEOF
+)
+
+export GITEA_ACCESS_URL LEARNER_USERNAME CODER_ACCESS_URL CODER_USER_ID
+WF_B64=$(echo "${WF_TEMPLATE}" | envsubst '${GITEA_ACCESS_URL} ${LEARNER_USERNAME} ${CODER_ACCESS_URL} ${CODER_USER_ID}' | base64 -w0)
+
+printf '%s' "$(jq -n --arg c "$WF_B64" '{message:"Add coder-agent CI workflow", content:$c, branch:"main"}')" \
+  | cx -s -X POST "${GITEA_INT}/api/v1/repos/${LEARNER_USERNAME}/memory-card-ai-demo/contents/.gitea/workflows/coder-agent.yml" \
+      -u "${LEARNER_USERNAME}:${LEARNER_PASSWORD}" -H "Content-Type: application/json" -d @- >/dev/null 2>&1 \
+  || echo "WARN: workflow file seed failed (verify Gitea contents API)."
+
+# Gitea Actions secrets the workflow needs: CODER_URL + CODER_SESSION_TOKEN + org id.
+for kv in "CODER_URL=http://coder:7080" "CODER_SESSION_TOKEN=${CODER_CI_TOKEN}" "CODER_ORG_ID=${DEFAULT_ORG_ID}"; do
+  k="${kv%%=*}"; v="${kv#*=}"
+  printf '%s' "$(jq -n --arg d "$v" '{data:$d}')" \
+    | cx -s -X PUT "${GITEA_INT}/api/v1/repos/${LEARNER_USERNAME}/memory-card-ai-demo/actions/secrets/${k}" \
+        -u "${GITEA_ADMIN_USERNAME}:${GITEA_ADMIN_PASSWORD}" -H "Content-Type: application/json" -d @- >/dev/null 2>&1 || echo "WARN: Gitea Actions secret ${k} set failed."
+done
+
+# Mint a runner registration token and (re)start act_runner with it.
+RUNNER_TOKEN=$(docker compose exec -T -u git gitea gitea actions generate-runner-token 2>/dev/null | tr -d '\r\n' || true)
+if [ -n "${RUNNER_TOKEN}" ]; then
+  echo "GITEA_RUNNER_TOKEN=${RUNNER_TOKEN}" > /etc/coder/.env
+  docker compose up -d --force-recreate act_runner || echo "WARN: act_runner recreate failed."
+  echo "act_runner registered."
+else
+  echo "WARN: could not mint Gitea runner token; C04 runner offline until registered (verify Gitea CLI)."
+fi
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Surface URLs + (Gitea) creds to challenge bodies via [[ Instruqt-Var ]]
+# NOTE: no local-learner Coder creds — learners sign in with GitHub (device flow).
+# ──────────────────────────────────────────────────────────────────────────────
+agent variable set SANDBOX_ID "${_SANDBOX_ID}"
+agent variable set CODER_URL "${CODER_ACCESS_URL}"
+agent variable set GITEA_URL "${GITEA_ACCESS_URL}"
+agent variable set GITEA_USERNAME "${LEARNER_USERNAME}"
+agent variable set GITEA_PASSWORD "${LEARNER_PASSWORD}"
+agent variable set GITEA_REPO_URL "${GITEA_ACCESS_URL}/${LEARNER_USERNAME}/memory-card-ai-demo"
+agent variable set GITEA_ISSUES_URL "${GITEA_ACCESS_URL}/${LEARNER_USERNAME}/memory-card-ai-demo/issues"
+agent variable set GITEA_ACTIONS_URL "${GITEA_ACCESS_URL}/${LEARNER_USERNAME}/memory-card-ai-demo/actions"
+agent variable set GRAFANA_URL "${GRAFANA_ACCESS_URL}"
+agent variable set CODER_ADMIN_EMAIL "${CODER_ADMIN_EMAIL}"
+agent variable set CODER_ADMIN_USERNAME "${CODER_ADMIN_USERNAME}"
+agent variable set CODER_ADMIN_PASSWORD "${CODER_ADMIN_PASSWORD}"
+agent variable set CODER_USER_EMAIL "${CODER_USER_EMAIL}"
+agent variable set CODER_USER_USERNAME "${CODER_USER_USERNAME}"
+agent variable set CODER_USER_PASSWORD "${CODER_USER_PASSWORD}"
+
+echo "${CODER_ADMIN_TOKEN}" > /etc/coder/admin.token; chmod 600 /etc/coder/admin.token
+echo "########## setup-workshop: complete ##########"
+
+echo "HOSTNAME=$HOSTNAME"
+hostname

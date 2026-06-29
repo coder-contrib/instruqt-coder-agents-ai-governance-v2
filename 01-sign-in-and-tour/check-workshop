@@ -1,0 +1,51 @@
+#!/bin/bash
+# Validates the learner signed in to Coder via GitHub: a non-admin user now exists
+# (someone other than the provisioning admin has authenticated). Device-flow login
+# can't be scripted, so we check for the resulting user rather than the flow itself.
+set -uo pipefail
+PS4='+$0[$LINENO]+ '
+
+CODER_ACCESS_URL="https://workshop-80-${_SANDBOX_ID}.env.play.instruqt.com"
+CODER_ADMIN_TOKEN=$(cat /etc/coder/admin.token 2>/dev/null || echo "")
+if [ -z "${CODER_ADMIN_TOKEN}" ]; then
+  fail-message "The Coder control plane isn't ready yet (no admin token). Wait a few seconds and click Check again; if it persists, restart the lab." || true
+  exit 1
+fi
+
+AUDIT=$(curl -sS -G -H "Coder-Session-Token: ${CODER_ADMIN_TOKEN}" \
+  --data-urlencode "limit=100" \
+  "${CODER_ACCESS_URL}/api/v2/audit" 2>/dev/null || echo "")
+
+# Use jq to reliably detect a successful login in the audit logs.
+# The /api/v2/audit response wraps entries in .audit_logs[].
+# A login is recorded as action="login" with a 2xx status code (typically 201).
+LOGIN_COUNT=$(echo "${AUDIT}" | jq '[.audit_logs[] | select(.action == "login" and (.status_code >= 200 and .status_code < 300))] | length' 2>/dev/null || echo "0")
+
+if [ "${LOGIN_COUNT}" -gt 0 ] 2>/dev/null; then
+  :
+else
+  fail-message "No successful login event recorded yet. In the Coder tab sign in with the provided username and password (Step 1) before clicking Check." || true
+  exit 1
+fi
+
+# Belt-and-suspenders: ensure each signed-in (non-admin) GitHub user has the built-in
+# 'agents-access' org role (Agents UI + model dropdown) AND the read-only 'auditor' site
+# role (Admin settings -> AI Sessions) — even if the systemd reconciler hasn't caught them
+# yet. The Check button runs AFTER sign-in, so this is the reliable delivery path for C01,
+# whose per-challenge setup runs before the learner logs in. Idempotent.
+# NOTE: var is UID2, never UID (UID is a read-only bash builtin).
+ORG_ID=$(curl -s -H "Coder-Session-Token: ${CODER_ADMIN_TOKEN}" "${CODER_ACCESS_URL}/api/v2/organizations" 2>/dev/null | jq -r '.[0].id' 2>/dev/null || echo "")
+if [ -n "${ORG_ID}" ] && [ "${ORG_ID}" != "null" ]; then
+  echo "${USERS}" | jq -r '.users[]? | select(.username != "admin") | .id' 2>/dev/null | while read -r UID2; do
+    [ -z "${UID2}" ] && continue
+    printf '%s' '{"roles": ["agents-access"]}' \
+      | curl -s -o /dev/null -X PUT "${CODER_ACCESS_URL}/api/v2/organizations/${ORG_ID}/members/${UID2}/roles" \
+          -H "Coder-Session-Token: ${CODER_ADMIN_TOKEN}" -H "Content-Type: application/json" -d @- || true
+    printf '%s' '{"roles": ["auditor"]}' \
+      | curl -s -o /dev/null -X PUT "${CODER_ACCESS_URL}/api/v2/users/${UID2}/roles" \
+          -H "Coder-Session-Token: ${CODER_ADMIN_TOKEN}" -H "Content-Type: application/json" -d @- || true
+  done
+fi
+
+WHO=$(echo "${USERS}" | jq -r '[.users[]? | select(.username != "admin") | .username][0]' 2>/dev/null)
+set-status "Signed in to Coder as ${WHO}. The agent answers without provisioning a workspace." 2>/dev/null || true

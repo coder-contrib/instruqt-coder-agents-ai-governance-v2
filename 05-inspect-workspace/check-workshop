@@ -1,0 +1,31 @@
+#!/bin/bash
+# Validates the learner ran the inspection by finding /tmp/.workshop-inspected
+# inside any Coder workspace container.
+set -uo pipefail
+PS4='+$0[$LINENO]+ '
+
+mapfile -t CANDIDATES < <(
+  docker ps --filter "label=coder.workspace_id" --format '{{.Names}}' 2>/dev/null
+  docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^coder-' || true
+)
+mapfile -t CANDIDATES < <(printf '%s\n' "${CANDIDATES[@]}" | awk 'NF' | sort -u)
+
+if [ "${#CANDIDATES[@]}" -eq 0 ]; then
+  fail-message "No Coder workspace container is running. Open the workspace your agent created (Coder tab) and run the inspection commands from Steps 2-5 in its terminal." || true
+  exit 1
+fi
+
+FOUND=0
+for c in "${CANDIDATES[@]}"; do
+  if docker exec "$c" test -f /tmp/.workshop-inspected 2>/dev/null; then
+    FOUND=1
+    set-status "Inspection sentinel detected in workspace container: ${c}" 2>/dev/null || true
+    break
+  fi
+done
+
+if [ "${FOUND}" -eq 0 ]; then
+  fail-message "Couldn't find /tmp/.workshop-inspected in any workspace container. Open your workspace's terminal (Coder tab) and run the commands from Steps 2-5 — the last one writes the sentinel the check looks for." || true
+  exit 1
+fi
+exit 0

@@ -1,0 +1,46 @@
+#!/bin/bash
+# Idempotent solve for 03: ensure the feature branch + open a PR via the Gitea API.
+set -uo pipefail
+
+GITEA_ACCESS_URL="https://workshop-8081-${_SANDBOX_ID}.env.play.instruqt.com"
+LEARNER_USERNAME=$(agent variable get GITEA_USERNAME 2>/dev/null || echo "learner")
+LEARNER_PASSWORD=$(agent variable get GITEA_PASSWORD 2>/dev/null || echo "WorkshopL3arner!")
+BRANCH_NAME="agent/card-back-diamond"
+REPO="${GITEA_ACCESS_URL}/api/v1/repos/${LEARNER_USERNAME}/memory-card-ai-demo"
+
+# 1. Feature branch off main (idempotent).
+curl -s -X POST "${REPO}/branches" \
+  -u "${LEARNER_USERNAME}:${LEARNER_PASSWORD}" -H "Content-Type: application/json" \
+  -d "$(jq -n --arg n "${BRANCH_NAME}" '{new_branch_name: $n, old_branch_name: "main"}')" \
+  >/dev/null 2>&1 || true
+
+# 2. Commit a change ON the branch so it differs from main. A PR needs a diff —
+#    a branch with no commits ahead of main is rejected by Gitea ("branches are equal"),
+#    which is why opening the PR silently failed before. Create/update a file via the
+#    contents API (idempotent: pass the existing sha when the file is already there).
+CONTENT=$(printf 'Card-back redesign: add a red diamond motif to the card backs.\nImplemented via the workshop agent under the learner identity.\n' | base64 | tr -d '\n')
+SHA=$(curl -s -u "${LEARNER_USERNAME}:${LEARNER_PASSWORD}" \
+  "${REPO}/contents/AGENT_CHANGE.md?ref=${BRANCH_NAME}" 2>/dev/null | jq -r '.sha // empty' 2>/dev/null)
+if [ -n "${SHA}" ]; then
+  curl -s -X PUT "${REPO}/contents/AGENT_CHANGE.md" \
+    -u "${LEARNER_USERNAME}:${LEARNER_PASSWORD}" -H "Content-Type: application/json" \
+    -d "$(jq -n --arg c "${CONTENT}" --arg b "${BRANCH_NAME}" --arg s "${SHA}" '{content:$c, branch:$b, sha:$s, message:"Add red diamond to card backs"}')" \
+    >/dev/null 2>&1 || true
+else
+  curl -s -X POST "${REPO}/contents/AGENT_CHANGE.md" \
+    -u "${LEARNER_USERNAME}:${LEARNER_PASSWORD}" -H "Content-Type: application/json" \
+    -d "$(jq -n --arg c "${CONTENT}" --arg b "${BRANCH_NAME}" '{content:$c, branch:$b, message:"Add red diamond to card backs"}')" \
+    >/dev/null 2>&1 || true
+fi
+
+# 3. Open the PR if none exists for this branch (now valid — the branch has a diff).
+EXISTING=$(curl -s -u "${LEARNER_USERNAME}:${LEARNER_PASSWORD}" \
+  "${REPO}/pulls?state=open" 2>/dev/null \
+  | jq -r --arg b "${BRANCH_NAME}" '[.[] | select(.head.ref == $b)] | length' 2>/dev/null || echo "0")
+if [ "${EXISTING:-0}" -lt 1 ]; then
+  curl -s -X POST "${REPO}/pulls" \
+    -u "${LEARNER_USERNAME}:${LEARNER_PASSWORD}" -H "Content-Type: application/json" \
+    -d "$(jq -n --arg b "${BRANCH_NAME}" '{title: "Add a red diamond to card backs", head: $b, base: "main", body: "Implements the card-back design issue. Authored via the workshop learner identity."}')" \
+    >/dev/null 2>&1 || true
+fi
+exit 0

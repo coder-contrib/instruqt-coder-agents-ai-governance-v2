@@ -1,0 +1,65 @@
+#!/bin/bash
+# Defensive setup for 02-pick-issue-and-start.
+# Ensures Gitea is up, the repo exists, and the five curated issues are present.
+set -uo pipefail
+PS4='+$0[$LINENO]+ '
+
+GITEA_ACCESS_URL="https://workshop-8081-${_SANDBOX_ID}.env.play.instruqt.com"
+LEARNER_USERNAME=$(agent variable get GITEA_USERNAME 2>/dev/null || echo "learner")
+LEARNER_PASSWORD=$(agent variable get GITEA_PASSWORD 2>/dev/null || echo "WorkshopL3arner!")
+
+n=0
+until [ "$n" -ge 30 ]; do
+  code=$(curl -s -o /dev/null -w "%{http_code}" "${GITEA_ACCESS_URL}/" || echo "000")
+  if echo "$code" | grep -qE "^(200|302)$"; then break; fi
+  n=$((n+1)); sleep 3
+done
+
+REPO_RESP=$(curl -s -u "${LEARNER_USERNAME}:${LEARNER_PASSWORD}" \
+  "${GITEA_ACCESS_URL}/api/v1/repos/${LEARNER_USERNAME}/memory-card-ai-demo" 2>/dev/null || echo "")
+if ! echo "${REPO_RESP}" | jq -e '.id' >/dev/null 2>&1; then
+  echo "WARNING: memory-card-ai-demo repo not found for ${LEARNER_USERNAME}." >&2
+fi
+
+EXISTING=$(curl -s -u "${LEARNER_USERNAME}:${LEARNER_PASSWORD}" \
+  "${GITEA_ACCESS_URL}/api/v1/repos/${LEARNER_USERNAME}/memory-card-ai-demo/issues?state=open" 2>/dev/null || echo "[]")
+COUNT=$(echo "${EXISTING}" | jq -r 'if type=="array" then length else 0 end' 2>/dev/null || echo "0")
+echo "Open issues found: ${COUNT} (expecting 5)"
+
+reseed() {
+  local title=$1; local body=$2
+  if ! echo "${EXISTING}" | jq -e --arg t "$title" '.[] | select(.title == $t)' >/dev/null 2>&1; then
+    curl -s -X POST "${GITEA_ACCESS_URL}/api/v1/repos/${LEARNER_USERNAME}/memory-card-ai-demo/issues" \
+      -u "${LEARNER_USERNAME}:${LEARNER_PASSWORD}" -H "Content-Type: application/json" \
+      -d "$(jq -n --arg t "$title" --arg b "$body" '{title: $t, body: $b}')" >/dev/null
+  fi
+}
+
+if [ "${COUNT}" -lt 5 ]; then
+  echo "Re-seeding curated issues..."
+  reseed "Change the card back design" "Add a visible red diamond to the back face of each card; it disappears when a card is flipped face-up. Difficulty: Easy."
+  reseed "Add difficulty levels (4x4, 6x6, 8x8)" "Let the player pick a grid size before each game. Difficulty: Advanced."
+  reseed "Implement high score persistence" "Track and persist the best score across sessions. Difficulty: Intermediate."
+  reseed "Create a theme selector" "Let the player pick a card-symbol theme (Animals, Emoji, Flags). Difficulty: Intermediate."
+  reseed "Add a countdown timer" "Introduce a 60-second countdown lose condition. Difficulty: Intermediate."
+fi
+
+# Grant the non-owner learner(s) the read-only 'auditor' site role (per Jason 2026-06-17:
+# applied in EVERY challenge so the learner always holds the read-only auditor seat, e.g.
+# to open Admin settings -> AI Sessions). auditor is read-only and exposes no secrets
+# (provider creds / MCP PAT / OAuth secret are write-only in Coder). Idempotent.
+ADMIN_TOK=$(cat /etc/coder/admin.token 2>/dev/null | tr -d '\r\n')
+if [ -n "${ADMIN_TOK}" ]; then
+  curl -s -H "Coder-Session-Token: ${ADMIN_TOK}" "http://localhost/api/v2/users" 2>/dev/null \
+    | jq -r '.users[]? | select(.username != "admin") | .id' 2>/dev/null \
+    | while read -r MID; do
+        [ -z "${MID}" ] && continue
+        code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
+          "http://localhost/api/v2/users/${MID}/roles" \
+          -H "Coder-Session-Token: ${ADMIN_TOK}" -H "Content-Type: application/json" \
+          -d '{"roles":["auditor"]}' || echo "000")
+        echo "C02: granted auditor to ${MID} (HTTP ${code})"
+      done
+else
+  echo "C02: admin token not found; auditor grant skipped."
+fi

@@ -1,0 +1,43 @@
+#!/bin/bash
+# Defensive setup for 04-trigger-agent-gitea-actions.
+# Re-asserts (idempotently) that Gitea is up, the repo exists, and the coder-agent
+# workflow is present. The act_runner + Actions secrets are provisioned at track level.
+set -uo pipefail
+
+GITEA_ACCESS_URL="https://workshop-8081-${_SANDBOX_ID}.env.play.instruqt.com"
+LEARNER_USERNAME=$(agent variable get GITEA_USERNAME 2>/dev/null || echo "learner")
+LEARNER_PASSWORD=$(agent variable get GITEA_PASSWORD 2>/dev/null || echo "WorkshopL3arner!")
+
+n=0
+until [ "$n" -ge 30 ]; do
+  code=$(curl -s -o /dev/null -w "%{http_code}" "${GITEA_ACCESS_URL}/" || echo "000")
+  echo "$code" | grep -qE "^(200|302)$" && break
+  n=$((n+1)); sleep 3
+done
+
+# Confirm the workflow file exists; warn (don't abort) if absent.
+WF=$(curl -s -u "${LEARNER_USERNAME}:${LEARNER_PASSWORD}" \
+  "${GITEA_ACCESS_URL}/api/v1/repos/${LEARNER_USERNAME}/memory-card-ai-demo/contents/.gitea/workflows/coder-agent.yml" 2>/dev/null || echo "")
+if ! echo "${WF}" | jq -e '.name' >/dev/null 2>&1; then
+  echo "WARN: coder-agent workflow not found in repo — track-level setup should have seeded it."
+fi
+
+# Grant the non-owner learner(s) the read-only 'auditor' site role (per Jason 2026-06-17:
+# applied in EVERY challenge so the learner always holds the read-only auditor seat, e.g.
+# to open Admin settings -> AI Sessions). auditor is read-only and exposes no secrets
+# (provider creds / MCP PAT / OAuth secret are write-only in Coder). Idempotent.
+ADMIN_TOK=$(cat /etc/coder/admin.token 2>/dev/null | tr -d '\r\n')
+if [ -n "${ADMIN_TOK}" ]; then
+  curl -s -H "Coder-Session-Token: ${ADMIN_TOK}" "http://localhost/api/v2/users" 2>/dev/null \
+    | jq -r '.users[]? | select(.username != "admin") | .id' 2>/dev/null \
+    | while read -r MID; do
+        [ -z "${MID}" ] && continue
+        code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
+          "http://localhost/api/v2/users/${MID}/roles" \
+          -H "Coder-Session-Token: ${ADMIN_TOK}" -H "Content-Type: application/json" \
+          -d '{"roles":["auditor"]}' || echo "000")
+        echo "C04: granted auditor to ${MID} (HTTP ${code})"
+      done
+else
+  echo "C04: admin token not found; auditor grant skipped."
+fi

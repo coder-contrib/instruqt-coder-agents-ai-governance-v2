@@ -1,0 +1,67 @@
+#!/bin/bash
+# Idempotent solve for 04: dispatch the coder-agent workflow via the Gitea API so a
+# real Actions run is created (what the learner would do via the UI). Falls back to
+# calling the Coder Agents API directly if workflow dispatch isn't available.
+set -uo pipefail
+
+GITEA_ACCESS_URL="https://workshop-8081-${_SANDBOX_ID}.env.play.instruqt.com"
+CODER_ACCESS_URL="https://workshop-80-${_SANDBOX_ID}.env.play.instruqt.com"
+LEARNER_USERNAME=$(agent variable get GITEA_USERNAME 2>/dev/null || echo "learner")
+LEARNER_PASSWORD=$(agent variable get GITEA_PASSWORD 2>/dev/null || echo "WorkshopL3arner!")
+
+PROMPT="Implement the 'Change the card back design' issue in the memory-card-ai-demo repo that is already cloned in your workspace: add a visible red diamond to the back face of every card that disappears when the card is flipped face-up. Create a feature branch named ci/card-back-design, commit your change, push the branch to origin, and open a pull request into main."
+
+# 1) Dispatch the real Gitea Actions workflow (what the learner does via the UI) so a
+#    genuine CI run appears. GitHub-compatible workflow_dispatch surface.
+DISPATCH_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+  "${GITEA_ACCESS_URL}/api/v1/repos/${LEARNER_USERNAME}/memory-card-ai-demo/actions/workflows/coder-agent.yml/dispatches" \
+  -u "${LEARNER_USERNAME}:${LEARNER_PASSWORD}" -H "Content-Type: application/json" \
+  -d "{\"ref\":\"main\",\"inputs\":{\"prompt\":\"${PROMPT}\"}}" 2>/dev/null || echo "000")
+echo "workflow dispatch HTTP ${DISPATCH_CODE}"
+
+# 2) Always also drive the Coder Agents API directly (same call the workflow makes), so
+#    the CI-triggered chat (client_type:"api") exists IMMEDIATELY — the async runner
+#    takes ~30s to pull its image, which would otherwise race the check on a skip/test.
+TOKEN=$(cat /etc/coder/admin.token 2>/dev/null | tr -d '\r\n' || echo "")
+if [ -n "${TOKEN}" ]; then
+  ORG=$(curl -s -H "Coder-Session-Token: ${TOKEN}" "${CODER_ACCESS_URL}/api/v2/organizations" | jq -r '.[0].id // empty' 2>/dev/null)
+  if [ -n "${ORG}" ]; then
+    curl -s -o /dev/null -X POST "${CODER_ACCESS_URL}/api/experimental/chats" \
+      -H "Coder-Session-Token: ${TOKEN}" -H "Content-Type: application/json" \
+      -d "{\"organization_id\":\"${ORG}\",\"content\":[{\"type\":\"text\",\"text\":\"${PROMPT}\"}]}" || true
+  fi
+fi
+
+# 3) Deterministically guarantee the ci/ PR the tightened check requires (the async
+#    runner+agent can be slow/flaky on skip/test): create the ci/ branch + a committed
+#    diff + the PR via the Gitea API (idempotent, sha-aware), mirroring the C03 solve.
+BRANCH_NAME="ci/card-back-design"
+REPO="${GITEA_ACCESS_URL}/api/v1/repos/${LEARNER_USERNAME}/memory-card-ai-demo"
+curl -s -X POST "${REPO}/branches" \
+  -u "${LEARNER_USERNAME}:${LEARNER_PASSWORD}" -H "Content-Type: application/json" \
+  -d "$(jq -n --arg n "${BRANCH_NAME}" '{new_branch_name: $n, old_branch_name: "main"}')" \
+  >/dev/null 2>&1 || true
+CONTENT=$(printf 'CI-triggered card-back redesign: add a red diamond motif to the card backs.\nOpened by the CI pipeline (machine identity), not a human.\n' | base64 | tr -d '\n')
+SHA=$(curl -s -u "${LEARNER_USERNAME}:${LEARNER_PASSWORD}" \
+  "${REPO}/contents/CI_AGENT_CHANGE.md?ref=${BRANCH_NAME}" 2>/dev/null | jq -r '.sha // empty' 2>/dev/null)
+if [ -n "${SHA}" ]; then
+  curl -s -X PUT "${REPO}/contents/CI_AGENT_CHANGE.md" \
+    -u "${LEARNER_USERNAME}:${LEARNER_PASSWORD}" -H "Content-Type: application/json" \
+    -d "$(jq -n --arg c "${CONTENT}" --arg b "${BRANCH_NAME}" --arg s "${SHA}" '{content:$c, branch:$b, sha:$s, message:"CI: add red diamond to card backs"}')" \
+    >/dev/null 2>&1 || true
+else
+  curl -s -X POST "${REPO}/contents/CI_AGENT_CHANGE.md" \
+    -u "${LEARNER_USERNAME}:${LEARNER_PASSWORD}" -H "Content-Type: application/json" \
+    -d "$(jq -n --arg c "${CONTENT}" --arg b "${BRANCH_NAME}" '{content:$c, branch:$b, message:"CI: add red diamond to card backs"}')" \
+    >/dev/null 2>&1 || true
+fi
+EXISTING=$(curl -s -u "${LEARNER_USERNAME}:${LEARNER_PASSWORD}" \
+  "${REPO}/pulls?state=open" 2>/dev/null \
+  | jq -r --arg b "${BRANCH_NAME}" '[.[] | select(.head.ref == $b)] | length' 2>/dev/null || echo "0")
+if [ "${EXISTING:-0}" -lt 1 ]; then
+  curl -s -X POST "${REPO}/pulls" \
+    -u "${LEARNER_USERNAME}:${LEARNER_PASSWORD}" -H "Content-Type: application/json" \
+    -d "$(jq -n --arg b "${BRANCH_NAME}" '{title: "CI: add a red diamond to card backs", head: $b, base: "main", body: "Triggered by the Gitea Actions CI pipeline (machine identity)."}')" \
+    >/dev/null 2>&1 || true
+fi
+exit 0

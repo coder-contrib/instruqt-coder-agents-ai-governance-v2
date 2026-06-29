@@ -1,0 +1,57 @@
+#!/bin/bash
+# Validates the learner ran the coder-agent CI workflow: a Gitea Actions run/task
+# exists for the repo. RUNTIME-VERIFY the exact Gitea Actions API shape; this check
+# tries the tasks endpoint and tolerates schema differences.
+set -uo pipefail
+PS4='+$0[$LINENO]+ '
+
+GITEA_ACCESS_URL="https://workshop-8081-${_SANDBOX_ID}.env.play.instruqt.com"
+LEARNER_USERNAME=$(agent variable get GITEA_USERNAME 2>/dev/null || echo "learner")
+LEARNER_PASSWORD=$(agent variable get GITEA_PASSWORD 2>/dev/null || echo "WorkshopL3arner!")
+
+code=$(curl -s -o /dev/null -w "%{http_code}" "${GITEA_ACCESS_URL}/" || echo "000")
+if ! echo "$code" | grep -qE "^(200|302)$"; then
+  fail-message "Gitea isn't reachable (HTTP ${code}). Wait a few seconds and click Check again." || true
+  exit 1
+fi
+
+RESP=$(curl -s -u "${LEARNER_USERNAME}:${LEARNER_PASSWORD}" \
+  "${GITEA_ACCESS_URL}/api/v1/repos/${LEARNER_USERNAME}/memory-card-ai-demo/actions/tasks" 2>/dev/null || echo "")
+# Count tasks/runs across likely response shapes.
+COUNT=$(echo "${RESP}" | jq -r '(.workflow_runs // .tasks // []) | length' 2>/dev/null || echo "0")
+[ -z "${COUNT}" ] && COUNT=0
+
+# Gather evidence the agent was CI-triggered. PASS now REQUIRES (2) — the visible ci/ PR.
+# (1) is informational only: it appears instantly and can't prove the agent actually
+# produced a branch/PR, so accepting it previously green-lit a run with no PR.
+#   (1) a CI-tagged chat via the Coder API — chats created through the API carry
+#       client_type == "api" (the learner's own UI chats do not); appears immediately.
+#   (2) a distinct ci/-prefixed PR in Gitea — the visible result the agent produces
+#       (~1-2 min later). The CI token is the admin identity, so the chat query uses
+#       the admin token written to disk at setup.
+ADMIN_TOK=$(cat /etc/coder/admin.token 2>/dev/null | tr -d '\r\n')
+CI_CHATS=0
+if [ -n "${ADMIN_TOK}" ]; then
+  CHATS_JSON=$(curl -s -H "Coder-Session-Token: ${ADMIN_TOK}" "http://localhost/api/experimental/chats" 2>/dev/null || echo "")
+  CI_CHATS=$(echo "${CHATS_JSON}" | jq -r '[.[]? | select(.client_type=="api")] | length' 2>/dev/null || echo "0")
+  [ -z "${CI_CHATS}" ] && CI_CHATS=0
+fi
+
+PR_JSON=$(curl -s -u "${LEARNER_USERNAME}:${LEARNER_PASSWORD}" \
+  "${GITEA_ACCESS_URL}/api/v1/repos/${LEARNER_USERNAME}/memory-card-ai-demo/pulls?state=all&limit=50" 2>/dev/null || echo "")
+CI_PRS=$(echo "${PR_JSON}" | jq -r '[.[]? | select(.head.ref | startswith("ci/"))] | length' 2>/dev/null || echo "0")
+[ -z "${CI_PRS}" ] && CI_PRS=0
+
+# PASS requires the visible CI outcome: a PR from a ci/-prefixed branch (the C04 payoff).
+if [ "${CI_PRS}" -ge 1 ]; then
+  set-status "CI-triggered agent opened a ci/ PR (ci/ PRs: ${CI_PRS}; api chats: ${CI_CHATS}; Actions runs: ${COUNT})." 2>/dev/null || true
+  exit 0
+fi
+
+# Not passing yet — tiered, actionable reason.
+if [ "${COUNT}" -lt 1 ] && [ "${CI_CHATS}" -lt 1 ]; then
+  fail-message "No CI run yet. Open the Actions tab and run the 'coder-agent' workflow (Step 2), then click Check." || true
+  exit 1
+fi
+fail-message "The CI workflow ran and the agent is working, but its pull request hasn't appeared yet. The CI-triggered agent provisions its own workspace, implements the change, and opens a PR from a ci/ branch — this takes a minute or two. Open the Pull Requests tab, wait and refresh, then click Check again." || true
+exit 1

@@ -1,0 +1,37 @@
+#!/bin/bash
+# Defensive setup for 05-ai-gateway-and-grafana: confirm Coder + Grafana reachable.
+set -uo pipefail
+
+CODER_ACCESS_URL="https://workshop-80-${_SANDBOX_ID}.env.play.instruqt.com"
+GRAFANA_ACCESS_URL="https://workshop-3001-${_SANDBOX_ID}.env.play.instruqt.com"
+
+for url in "${CODER_ACCESS_URL}/healthz" "${GRAFANA_ACCESS_URL}/api/health"; do
+  n=0
+  until [ "$n" -ge 20 ]; do
+    code=$(curl -s -o /dev/null -w "%{http_code}" "$url" || echo "000")
+    if echo "$code" | grep -qE "^(200|302|404)$"; then break; fi
+    n=$((n+1)); sleep 3
+  done
+done
+
+# Grant the non-owner learner(s) the read-only 'auditor' site role. Granted in EVERY
+# challenge's setup (per Jason 2026-06-17), not only here, so the learner holds the
+# read-only auditor seat throughout -- here it lets them open Admin settings -> AI
+# Sessions for this challenge's gateway audit. auditor is read-only and exposes no
+# secrets (provider creds / MCP PAT / OAuth secret are write-only in Coder, never
+# returned even to owner -- verified 2026-06-16). Idempotent.
+ADMIN_TOK=$(cat /etc/coder/admin.token 2>/dev/null | tr -d '\r\n')
+if [ -n "${ADMIN_TOK}" ]; then
+  curl -s -H "Coder-Session-Token: ${ADMIN_TOK}" "http://localhost/api/v2/users" 2>/dev/null \
+    | jq -r '.users[]? | select(.username != "admin") | .id' 2>/dev/null \
+    | while read -r MID; do
+        [ -z "${MID}" ] && continue
+        code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
+          "http://localhost/api/v2/users/${MID}/roles" \
+          -H "Coder-Session-Token: ${ADMIN_TOK}" -H "Content-Type: application/json" \
+          -d '{"roles":["auditor"]}' || echo "000")
+        echo "C06: granted auditor to ${MID} (HTTP ${code})"
+      done
+else
+  echo "C06: admin token not found; auditor grant skipped (AI Sessions may be hidden for the learner)."
+fi

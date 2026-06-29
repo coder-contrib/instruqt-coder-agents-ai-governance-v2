@@ -1,0 +1,35 @@
+#!/bin/bash
+# Validates an open/any PR from a non-main branch into main exists.
+set -uo pipefail
+PS4='+$0[$LINENO]+ '
+
+GITEA_ACCESS_URL="https://workshop-8081-${_SANDBOX_ID}.env.play.instruqt.com"
+LEARNER_USERNAME=$(agent variable get GITEA_USERNAME 2>/dev/null || echo "learner")
+LEARNER_PASSWORD=$(agent variable get GITEA_PASSWORD 2>/dev/null || echo "WorkshopL3arner!")
+
+code=$(curl -s -o /dev/null -w "%{http_code}" "${GITEA_ACCESS_URL}/" || echo "000")
+if ! echo "$code" | grep -qE "^(200|302)$"; then
+  fail-message "Gitea isn't reachable (HTTP ${code}). Wait a few seconds and click Check again." || true
+  exit 1
+fi
+
+PRS=$(curl -s -u "${LEARNER_USERNAME}:${LEARNER_PASSWORD}" \
+  "${GITEA_ACCESS_URL}/api/v1/repos/${LEARNER_USERNAME}/memory-card-ai-demo/pulls?state=all" 2>/dev/null || echo "")
+if ! echo "${PRS}" | jq -e 'type=="array"' >/dev/null 2>&1; then
+  fail-message "Couldn't list pull requests in Gitea. Restart the lab if this persists." || true
+  exit 1
+fi
+
+# Relaxed: accept a PR into main from ANY non-main branch (any of the issues),
+# not specifically the card-back-design branch.
+ANY=$(echo "${PRS}" | jq -r '[.[] | select(.base.ref=="main") | select(.head.ref!="main")] | length' 2>/dev/null || echo "0")
+[ -z "${ANY}" ] && ANY=0
+
+if [ "${ANY}" -lt 1 ]; then
+  fail-message "No pull request into main found yet. In the Agents chat, ask the agent to finish the change and open a pull request into main (re-run Step 1's prompt), then click Check." || true
+  exit 1
+fi
+
+TITLE=$(echo "${PRS}" | jq -r '[.[] | select(.base.ref=="main") | select(.head.ref!="main")][0].title')
+set-status "Pull request into main: ${TITLE}" 2>/dev/null || true
+exit 0

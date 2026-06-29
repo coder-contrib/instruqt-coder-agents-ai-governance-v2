@@ -1,0 +1,23 @@
+#!/bin/bash
+# Validates the AI Gateway recorded at least one interception for this sandbox by
+# counting rows in aibridge_interceptions via the in-stack Postgres.
+# NOTE: aibridge_* table/column names are runtime-verify; this query degrades to a
+# learner-actionable hint rather than a hard crash if the schema differs.
+set -uo pipefail
+PS4='+$0[$LINENO]+ '
+
+COUNT=$(docker compose -f /etc/coder/docker-compose.yml exec -T postgres \
+  psql -U coder -d coder -tAc "SELECT count(*) FROM aibridge_interceptions;" 2>/dev/null | tr -d '[:space:]')
+
+if ! echo "${COUNT}" | grep -qE '^[0-9]+$'; then
+  fail-message "Couldn't read the AI Gateway audit table yet (it's created the first time the gateway records a request). Send one prompt through the Coder Agents chat, then click Check. If this persists, the AI Gateway may still be initializing under the trial license." || true
+  exit 1
+fi
+
+if [ "${COUNT}" -lt 1 ]; then
+  fail-message "The AI Gateway has no recorded requests yet. Send a prompt through the Coder Agents chat (any prompt), refresh the Grafana dashboard, then click Check." || true
+  exit 1
+fi
+
+set-status "AI Gateway audit trail populated: ${COUNT} intercepted request(s) recorded." 2>/dev/null || true
+exit 0

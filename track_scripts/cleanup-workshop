@@ -1,0 +1,12 @@
+#!/bin/bash
+# Track-level cleanup for coder-agents-ai-governance.
+#
+# The sandbox VM (and its Docker stack, volumes, and on-demand workspaces) is
+# destroyed by Instruqt when the play ends, so there is no external/costed
+# resource to tear down here — Bedrock is invoked statelessly via the Instruqt
+# AWS account, which Instruqt reclaims on its own. This script is a no-op kept
+# for lifecycle completeness and future use.
+
+set -uo pipefail
+echo "cleanup-workshop: nothing to do — Instruqt reclaims the VM, Docker stack, and AWS account."
+exit 0

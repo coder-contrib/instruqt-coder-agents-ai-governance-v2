@@ -1,0 +1,41 @@
+#!/bin/bash
+# Defensive per-challenge setup for 01-sign-in-and-tour.
+# Re-validates the Coder stack is healthy in case the learner paused or jumped ahead.
+set -uo pipefail
+
+CODER_ACCESS_URL="https://workshop-80-${_SANDBOX_ID}.env.play.instruqt.com"
+
+code=$(curl -s -o /dev/null -w "%{http_code}" "${CODER_ACCESS_URL}/healthz" || echo "000")
+if ! echo "$code" | grep -qE "^(200|404)$"; then
+  echo "Coder health check failed (code ${code}); waiting for stack..."
+  n=0
+  until [ "$n" -ge 30 ]; do
+    code=$(curl -s -o /dev/null -w "%{http_code}" "${CODER_ACCESS_URL}/healthz" || echo "000")
+    if echo "$code" | grep -qE "^(200|404)$"; then break; fi
+    n=$((n+1)); sleep 3
+  done
+fi
+
+if [ ! -s /etc/coder/admin.token ]; then
+  echo "WARNING: /etc/coder/admin.token missing — check script may not be able to validate via API."
+fi
+
+# Grant the non-owner learner(s) the read-only 'auditor' site role (per Jason 2026-06-17:
+# applied in EVERY challenge so the learner always holds the read-only auditor seat, e.g.
+# to open Admin settings -> AI Sessions). auditor is read-only and exposes no secrets
+# (provider creds / MCP PAT / OAuth secret are write-only in Coder). Idempotent.
+ADMIN_TOK=$(cat /etc/coder/admin.token 2>/dev/null | tr -d '\r\n')
+if [ -n "${ADMIN_TOK}" ]; then
+  curl -s -H "Coder-Session-Token: ${ADMIN_TOK}" "http://localhost/api/v2/users" 2>/dev/null \
+    | jq -r '.users[]? | select(.username != "admin") | .id' 2>/dev/null \
+    | while read -r MID; do
+        [ -z "${MID}" ] && continue
+        code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
+          "http://localhost/api/v2/users/${MID}/roles" \
+          -H "Coder-Session-Token: ${ADMIN_TOK}" -H "Content-Type: application/json" \
+          -d '{"roles":["auditor"]}' || echo "000")
+        echo "C01: granted auditor to ${MID} (HTTP ${code})"
+      done
+else
+  echo "C01: admin token not found; auditor grant skipped."
+fi

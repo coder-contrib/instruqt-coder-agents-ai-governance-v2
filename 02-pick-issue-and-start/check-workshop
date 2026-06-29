@@ -1,0 +1,39 @@
+#!/bin/bash
+# Validates a NEW feature branch (beyond the post-setup baseline) exists in the workshop repo.
+set -uo pipefail
+PS4='+$0[$LINENO]+ '
+
+GITEA_ACCESS_URL="https://workshop-8081-${_SANDBOX_ID}.env.play.instruqt.com"
+LEARNER_USERNAME=$(agent variable get GITEA_USERNAME 2>/dev/null || echo "learner")
+LEARNER_PASSWORD=$(agent variable get GITEA_PASSWORD 2>/dev/null || echo "WorkshopL3arner!")
+
+code=$(curl -s -o /dev/null -w "%{http_code}" "${GITEA_ACCESS_URL}/" || echo "000")
+if ! echo "$code" | grep -qE "^(200|302)$"; then
+  fail-message "Gitea isn't reachable (HTTP ${code}). Wait a few seconds and click Check again." || true
+  exit 1
+fi
+
+BRANCHES=$(curl -s -u "${LEARNER_USERNAME}:${LEARNER_PASSWORD}" \
+  "${GITEA_ACCESS_URL}/api/v1/repos/${LEARNER_USERNAME}/memory-card-ai-demo/branches" 2>/dev/null || echo "")
+if ! echo "${BRANCHES}" | jq -e 'type=="array"' >/dev/null 2>&1; then
+  fail-message "Couldn't list branches in Gitea. The workshop repo may not be ready — restart the lab if this persists." || true
+  exit 1
+fi
+
+# A new branch is one present now but NOT in the post-setup baseline. This is robust even if
+# the repo still carries inherited branches — only a learner/agent-created branch counts.
+CURRENT=$(echo "${BRANCHES}" | jq -r '.[]?.name' | sort -u)
+BASELINE=/etc/coder/c02-branch-baseline.txt
+if [ -f "${BASELINE}" ]; then
+  NEW=$(comm -23 <(printf '%s\n' "${CURRENT}") <(sort -u "${BASELINE}") | grep -v '^$' || true)
+else
+  # Fallback if the baseline file is missing: any branch beyond main/master.
+  NEW=$(printf '%s\n' "${CURRENT}" | grep -vE '^(main|master)$' | grep -v '^$' || true)
+fi
+
+if [ -z "${NEW}" ]; then
+  fail-message "No new feature branch yet. In the Coder Agents chat, ask the agent to implement the issue and create a feature branch (Step 2). Wait for the branch to appear under Branches in the Gitea tab, then click Check." || true
+  exit 1
+fi
+
+exit 0

@@ -1,0 +1,12 @@
+#!/bin/bash
+# Idempotent solve for 06: drive one gateway-routed request via the admin token so an
+# interception is recorded and the AI Gateway audit trail (aibridge_*) has >=1 row.
+set -uo pipefail
+CODER_ACCESS_URL="https://workshop-80-${_SANDBOX_ID}.env.play.instruqt.com"
+TOKEN=$(cat /etc/coder/admin.token 2>/dev/null || echo "")
+if [ -n "${TOKEN}" ]; then
+  curl -s -X POST "${CODER_ACCESS_URL}/api/v2/chats" \
+    -H "Coder-Session-Token: ${TOKEN}" -H "Content-Type: application/json" \
+    -d '{"message":"Briefly: what is the capital of France?"}' >/dev/null 2>&1 || true
+fi
+exit 0

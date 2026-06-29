@@ -1,0 +1,14 @@
+#!/bin/bash
+# Idempotent solve for 02: create a feature branch via the Gitea API.
+set -uo pipefail
+
+GITEA_ACCESS_URL="https://workshop-8081-${_SANDBOX_ID}.env.play.instruqt.com"
+LEARNER_USERNAME=$(agent variable get GITEA_USERNAME 2>/dev/null || echo "learner")
+LEARNER_PASSWORD=$(agent variable get GITEA_PASSWORD 2>/dev/null || echo "WorkshopL3arner!")
+BRANCH_NAME="agent/card-back-diamond"
+
+curl -s -X POST "${GITEA_ACCESS_URL}/api/v1/repos/${LEARNER_USERNAME}/memory-card-ai-demo/branches" \
+  -u "${LEARNER_USERNAME}:${LEARNER_PASSWORD}" -H "Content-Type: application/json" \
+  -d "$(jq -n --arg n "${BRANCH_NAME}" '{new_branch_name: $n, old_branch_name: "main"}')" \
+  >/dev/null 2>&1 || true
+exit 0
