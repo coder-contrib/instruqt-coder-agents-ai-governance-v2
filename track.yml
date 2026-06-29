@@ -1,7 +1,7 @@
 slug: coder-agents-ai-governance-v2
 id: 9ksq81aifgxz
-revision: -62135596800
-title: Coder Agents & AI Governance - v2
+revision: 1
+title: Coder Agents & AI Governance - v2 (In Progress)
 teaser: Drive a self-hosted coding agent from chat and from CI, prove the workspace
   holds no keys or agent binary, then audit every prompt, tool call, and token through
   the AI Gateway and Grafana.
