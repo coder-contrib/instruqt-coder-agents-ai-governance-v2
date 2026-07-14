@@ -19,7 +19,7 @@ fi
 ADMIN_TOK=$(cat /etc/coder/admin.token 2>/dev/null | tr -d '\r\n')
 if [ -n "${ADMIN_TOK}" ]; then
   curl -s -H "Coder-Session-Token: ${ADMIN_TOK}" "http://localhost/api/v2/users" 2>/dev/null \
-    | jq -r '.users[]? | select(.username != "admin") | .id' 2>/dev/null \
+    | jq -r '.users[]? | select(.username != "admin" and .username != "ci-bot") | .id' 2>/dev/null \
     | while read -r MID; do
         [ -z "${MID}" ] && continue
         code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \

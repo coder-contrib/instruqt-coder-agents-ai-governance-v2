@@ -179,14 +179,29 @@ cat > /etc/coder/Caddyfile <<'EOF'
     }
 }
 :8081 {
-    reverse_proxy gitea:3000 {
-        header_down -X-Frame-Options
-        header_down -Content-Security-Policy
-        # Transparent Gitea sign-in: present every request as the local 'learner'
-        # account (Gitea reverse-proxy auth). header_up SETS (replaces) the value, so a
-        # client can't spoof a different user through Caddy. Removes the "Sign in" button
-        # and gives the learner write access (Run workflow, open PR) in the embedded tab.
-        header_up X-WEBAUTH-USER learner
+    # OIDC back-channel endpoints Coder calls server-to-server (with the client secret and
+    # the bearer token). These MUST authenticate as themselves, so do NOT force a user
+    # header on them, or Gitea would resolve them as 'learner' and the token/userinfo
+    # exchange can misbehave. Exact-path match; /login/oauth/authorize is intentionally
+    # excluded so the browser authorize step still rides the reverse-proxy auth below.
+    @oidc_backchannel path /login/oauth/access_token /login/oauth/userinfo /login/oauth/keys
+    handle @oidc_backchannel {
+        reverse_proxy gitea:3000 {
+            header_down -X-Frame-Options
+            header_down -Content-Security-Policy
+        }
+    }
+    # Everything else (the Gitea UI and the /login/oauth/authorize page): present every
+    # request as the local 'learner' account via Gitea reverse-proxy auth. header_up SETS
+    # (replaces) the value, so a client can't spoof a different user through Caddy. This
+    # removes the "Sign in" button, gives the embedded tab write access, and makes the
+    # "Sign in with Gitea" handoff in Coder seamless (the authorize page is pre-authed).
+    handle {
+        reverse_proxy gitea:3000 {
+            header_down -X-Frame-Options
+            header_down -Content-Security-Policy
+            header_up X-WEBAUTH-USER learner
+        }
     }
 }
 :3001 {
@@ -275,7 +290,7 @@ if [ -z "${DASH_OK}" ]; then
     "targets":[{"rawSql":"SELECT count(*) AS value FROM aibridge_interceptions;","format":"table","refId":"A"}]},
    {"type":"table","title":"Requests by user","gridPos":{"h":10,"w":16,"x":8,"y":0},
     "datasource":{"type":"grafana-postgresql-datasource","uid":"coder-observability-ro"},
-    "targets":[{"rawSql":"SELECT u.username AS user, count(*) AS requests FROM aibridge_interceptions i JOIN users u ON i.initiator_id = u.id GROUP BY u.username ORDER BY requests DESC;","format":"table","refId":"A"}]},
+    "targets":[{"rawSql":"SELECT coalesce(NULLIF(u.name, ''), u.username) AS user, count(*) AS requests FROM aibridge_interceptions i JOIN users u ON i.initiator_id = u.id GROUP BY 1 ORDER BY requests DESC;","format":"table","refId":"A"}]},
    {"type":"timeseries","title":"Interceptions over time","gridPos":{"h":8,"w":24,"x":0,"y":10},
     "datasource":{"type":"grafana-postgresql-datasource","uid":"coder-observability-ro"},
     "targets":[{"rawSql":"SELECT date_trunc('minute', started_at) AS time, count(*) AS interceptions FROM aibridge_interceptions WHERE $__timeFilter(started_at) GROUP BY 1 ORDER BY 1;","format":"time_series","refId":"A"}]}
@@ -287,6 +302,11 @@ fi
 # runner reads it from /etc/coder/.env. Seed a placeholder so the first compose-up
 # doesn't choke; we recreate act_runner once the real token exists.
 echo "GITEA_RUNNER_TOKEN=pending" > /etc/coder/.env
+
+# Seed an empty OIDC env file so the coder service's env_file bind exists on the first
+# compose-up. Real CODER_OIDC_* values are written once Gitea and its OAuth2 app are ready
+# (see the Gitea block below), after which coder is recreated to pick them up.
+: > /etc/coder/coder-oidc.env
 
 # Docker Compose stack.
 cat > /etc/coder/docker-compose.yml <<EOF
@@ -303,6 +323,11 @@ services:
   coder:
     image: ghcr.io/coder/coder:v2.34.2
     depends_on: [postgres]
+    # OIDC login config (Gitea as the identity provider) is written to this file AFTER
+    # Gitea is up and the OAuth2 app exists, then coder is recreated to load it. The file
+    # is seeded empty before the first compose-up so this bind mount always exists.
+    env_file:
+      - /etc/coder/coder-oidc.env
     environment:
       CODER_PG_CONNECTION_URL: postgresql://coder:coder@postgres/coder?sslmode=disable
       CODER_HTTP_ADDRESS: 0.0.0.0:7080
@@ -445,33 +470,12 @@ CODER_ADMIN_EMAIL="admin@example.com"
 CODER_ADMIN_USERNAME="admin"
 CODER_ADMIN_PASSWORD="CoderAdmin-$(date +%s | tail -c 6)!aA"
 
-CODER_USER_EMAIL="${INSTRUQT_USER_EMAIL-user@example.com}"
-CODER_USER_PASSWORD="CoderUser-$(date +%s | tail -c 6)!aA"
-
-# Sanitize an arbitrary string into a valid Coder username.
-sanitize_username() {
-  local raw="$1"
-  # 1. Strip email domain
-  local s="${raw%@*}"
-  # 2. Replace runs of invalid characters with a single hyphen
-  s=$(echo "$s" | sed -E 's/[^a-zA-Z0-9-]+/-/g')
-  # 3. Collapse multiple hyphens
-  s=$(echo "$s" | sed -E 's/-+/-/g')
-  # 4. Trim leading/trailing hyphens
-  s="${s#-}"
-  s="${s%-}"
-  # 5. Truncate to 32 chars (and re-trim trailing hyphen if truncation left one)
-  s="${s:0:32}"
-  s="${s%-}"
-  # 6. Fallback if empty
-  if [ -z "$s" ]; then
-    s="user-$(head -c 4 /dev/urandom | base64 | tr -d '=' | tr '[:upper:]' '[:lower:]')"
-  fi
-  echo "$s"
-}
-
-CODER_USER_USERNAME=$(sanitize_username "${CODER_USER_EMAIL}")
-echo "Sanitized username: ${CODER_USER_USERNAME}"
+# No local learner account is created. Learners authenticate via Gitea OIDC (configured as
+# Coder's login provider in the Gitea block below), and Coder just-in-time creates their
+# user on first sign-in (CODER_OIDC_ALLOW_SIGNUPS=true). C01's challenge setup paints the
+# participant's real email + name onto the Gitea 'learner' account first, so the JIT-created
+# Coder identity carries the real identity (see 01-sign-in-and-tour/setup-workshop). The
+# provisioning admin below stays password-based, which is why password auth is left enabled.
 
 FIRST_USER_BODY=$(jq -n --arg email "$CODER_ADMIN_EMAIL" --arg username "$CODER_ADMIN_USERNAME" --arg password "$CODER_ADMIN_PASSWORD" \
   '{email: $email, username: $username, name: "Admin User", password: $password, trial: true,
@@ -492,56 +496,35 @@ DEFAULT_ORG_ID=$(echo "$ORG_RESP" | jq -r '.[0].id // empty')
 [ -z "$DEFAULT_ORG_ID" ] && { echo "FATAL: no default org. ${ORG_RESP}" >&2; exit 1; }
 echo "Org ID: ${DEFAULT_ORG_ID}"
 
-# Create user
-CODER_USER_RESP=$(cx -sS -w $'\n%{http_code}' -X POST "${CODER_INT}/api/v2/users" \
+# ──────────────────────────────────────────────────────────────────────────────
+# CI identity: a dedicated 'ci-bot' user (NOT admin), so the C04 CI-triggered chat is
+# attributed to a distinct machine identity in the C06 audit — the learner's GitHub/Gitea
+# identity beside 'ci-bot', rather than beside 'admin'. ci-bot's token becomes the CI
+# session token the Gitea Actions workflow uses (minted just below, after the template push).
+# ──────────────────────────────────────────────────────────────────────────────
+CI_BOT_USERNAME="ci-bot"
+# Capture ci-bot's password so the CI token can be minted by logging in AS ci-bot below.
+# Minting a token for another user via the admin session can be refused by Coder (owners
+# are not always permitted to create API keys for other users). That would fall back to the
+# admin token and reattribute C04's CI chat to 'admin', the exact bug this identity split
+# fixes, so we log in as ci-bot to mint instead and keep admin-mint only as a last resort.
+CI_BOT_PASSWORD="CiBot-$(date +%s | tail -c 6)!aA"
+CI_BOT_RESP=$(cx -sS -w $'\n%{http_code}' -X POST "${CODER_INT}/api/v2/users" \
   -H "Coder-Session-Token: ${CODER_ADMIN_TOKEN}" \
   -H "Content-Type: application/json" \
-  -d "{
-    \"email\": \"${CODER_USER_EMAIL}\",
-    \"username\": \"${CODER_USER_USERNAME}\",
-    \"password\": \"${CODER_USER_PASSWORD}\",
-    \"login_type\": \"password\",
-    \"organization_ids\": [\"${DEFAULT_ORG_ID}\"]
-  }")
-CODER_USER_HTTP=$(echo "${CODER_USER_RESP}" | tail -n1)
-CODER_USER_BODY=$(echo "${CODER_USER_RESP}" | sed '$d')
+  -d "$(jq -n --arg o "$DEFAULT_ORG_ID" --arg p "$CI_BOT_PASSWORD" \
+        '{email:"ci-bot@coder.local", username:"ci-bot", name:"CI Bot", password:$p, login_type:"password", organization_ids:[$o]}')")
+CI_BOT_HTTP=$(echo "${CI_BOT_RESP}" | tail -n1)
+CI_BOT_ID=$(echo "${CI_BOT_RESP}" | sed '$d' | jq -r '.id // empty')
+echo "ci-bot create HTTP ${CI_BOT_HTTP} (id=${CI_BOT_ID:-none})"
 
-if [ "${CODER_USER_HTTP}" != "201" ]; then
-  echo "Failed to create user (HTTP ${CODER_USER_HTTP}): ${CODER_USER_BODY}" >&2
-  exit 1
+# Grant ci-bot the built-in 'agents-access' role so its API-triggered chats run. chat:read
+# is sufficient; ci-bot deliberately does NOT get auditor (least-privilege machine identity).
+if [ -n "${CI_BOT_ID}" ]; then
+  printf '%s' '{"roles": ["agents-access"]}' \
+    | cx -s -o /dev/null -X PUT "${CODER_INT}/api/v2/organizations/${DEFAULT_ORG_ID}/members/${CI_BOT_ID}/roles" \
+        -H "Coder-Session-Token: ${CODER_ADMIN_TOKEN}" -H "Content-Type: application/json" -d @- || true
 fi
-
-CODER_USER_ID=$(echo "${CODER_USER_BODY}" | jq -r '.id // empty')
-if [ -z "${CODER_USER_ID}" ]; then
-  echo "User creation returned 201 but no id in response: ${CODER_USER_BODY}" >&2
-  exit 1
-fi
-echo "Created user ${CODER_USER_USERNAME} (${CODER_USER_ID})"
-
-# Create token
-TOKEN_NAME="token-$(head -c 6 /dev/urandom | base64 | tr -d '=' | tr '[:upper:]' '[:lower:]')"
-CODER_TOKEN_RESP=$(cx -sS -w $'\n%{http_code}' -X POST "${CODER_INT}/api/v2/users/${CODER_USER_USERNAME}/keys/tokens" \
-  -H "Coder-Session-Token: ${CODER_ADMIN_TOKEN}" \
-  -H "Content-Type: application/json" \
-  -d "{
-    \"lifetime\": "7200000000000",
-    \"token_name\": \"${TOKEN_NAME}\",
-    \"scope\": \"all\"
-  }")
-CODER_TOKEN_HTTP=$(echo "${CODER_TOKEN_RESP}" | tail -n1)
-CODER_TOKEN_BODY=$(echo "${CODER_TOKEN_RESP}" | sed '$d')
-
-if [ "${CODER_TOKEN_HTTP}" != "201" ]; then
-  echo "Failed to create token for ${CODER_USER_USERNAME} (HTTP ${CODER_TOKEN_HTTP}): ${CODER_TOKEN_BODY}" >&2
-  exit 1
-fi
-
-CODER_USER_TOKEN=$(echo "${CODER_TOKEN_BODY}" | jq -r '.key // empty')
-if [ -z "${CODER_USER_TOKEN}" ]; then
-  echo "Token creation returned 201 but no key in response: ${CODER_TOKEN_BODY}" >&2
-  exit 1
-fi
-echo "Created token ${TOKEN_NAME} for ${CODER_USER_USERNAME}"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Admin-UI fallback target values (printed for the presenter if any automation slips)
@@ -734,12 +717,29 @@ else
   echo "WARN: workspace template push failed; admin can retry from Templates UI." >&2
 fi
 
-# Mint a dedicated Coder token for the C04 CI workflow (headless Agents API calls).
-CI_TOKEN_RESP=$(printf '%s' '{"token_name":"ci-agent-token","scope":"all"}' \
-  | cx -s -X POST "${CODER_INT}/api/v2/users/me/keys/tokens" \
-      -H "Coder-Session-Token: ${CODER_ADMIN_TOKEN}" -H "Content-Type: application/json" -d @-)
-CODER_CI_TOKEN=$(echo "$CI_TOKEN_RESP" | jq -r '.key // empty')
-[ -z "${CODER_CI_TOKEN}" ] && { CODER_CI_TOKEN="${CODER_ADMIN_TOKEN}"; echo "WARN: dedicated CI token mint failed; using admin token for CI."; }
+# Mint the CI session token AS ci-bot (created above) for the C04 CI workflow's headless
+# Agents API calls, so the CI-triggered chat is attributed to ci-bot, not admin. Preferred
+# path: log in as ci-bot with its own password and mint the token on its own session, which
+# always carries the right owner. Fallbacks: admin mints on ci-bot's behalf, then the admin
+# token itself. Only the last resort reattributes CI to admin, and it says so loudly.
+CODER_CI_TOKEN=""
+CI_BOT_LOGIN=$(printf '%s' "$(jq -n --arg e "${CI_BOT_EMAIL:-ci-bot@coder.local}" --arg p "$CI_BOT_PASSWORD" '{email:$e, password:$p}')" \
+  | cx -s -X POST "${CODER_INT}/api/v2/users/login" -H "Content-Type: application/json" -d @-)
+CI_BOT_TOKEN=$(echo "$CI_BOT_LOGIN" | jq -r '.session_token // empty')
+if [ -n "${CI_BOT_TOKEN}" ]; then
+  CI_TOKEN_RESP=$(printf '%s' '{"token_name":"ci-agent-token","scope":"all"}' \
+    | cx -s -X POST "${CODER_INT}/api/v2/users/${CI_BOT_USERNAME}/keys/tokens" \
+        -H "Coder-Session-Token: ${CI_BOT_TOKEN}" -H "Content-Type: application/json" -d @-)
+  CODER_CI_TOKEN=$(echo "$CI_TOKEN_RESP" | jq -r '.key // empty')
+fi
+if [ -z "${CODER_CI_TOKEN}" ]; then
+  # Fallback 1: admin mints on ci-bot's behalf (works on Coder versions that allow it).
+  CI_TOKEN_RESP=$(printf '%s' '{"token_name":"ci-agent-token","scope":"all"}' \
+    | cx -s -X POST "${CODER_INT}/api/v2/users/${CI_BOT_USERNAME}/keys/tokens" \
+        -H "Coder-Session-Token: ${CODER_ADMIN_TOKEN}" -H "Content-Type: application/json" -d @-)
+  CODER_CI_TOKEN=$(echo "$CI_TOKEN_RESP" | jq -r '.key // empty')
+fi
+[ -z "${CODER_CI_TOKEN}" ] && { CODER_CI_TOKEN="${CODER_ADMIN_TOKEN}"; echo "WARN: ci-bot token mint failed (login and admin-mint both failed); using admin token for CI (C06 will attribute CI to admin)."; }
 
 # ──────────────────────────────────────────────────────────────────────────────
 # agents-access reconciler — systemd service (survives challenge transitions)
@@ -775,7 +775,7 @@ while true; do
   TOKEN="\$(cat /etc/coder/admin.token 2>/dev/null)"
   if [ -n "\${TOKEN}" ]; then
     ccurl -H "Coder-Session-Token: \${TOKEN}" "http://localhost:7080/api/v2/users" \
-      | jq -r '.users[]? | select(.username != "admin") | .id' 2>/dev/null \
+      | jq -r '.users[]? | select(.username != "admin" and .username != "ci-bot") | .id' 2>/dev/null \
       | while read -r MEMBER_ID; do
           [ -z "\${MEMBER_ID}" ] && continue
           grep -qxF "\${MEMBER_ID}" "\${STATE}" && continue
@@ -848,6 +848,83 @@ LEARNER_USERNAME="learner"; LEARNER_PASSWORD="WorkshopL3arner!"; LEARNER_EMAIL="
 
 docker compose exec -T -u git gitea gitea admin user create --username "${GITEA_ADMIN_USERNAME}" --password "${GITEA_ADMIN_PASSWORD}" --email "${GITEA_ADMIN_EMAIL}" --admin --must-change-password=false
 docker compose exec -T -u git gitea gitea admin user create --username "${LEARNER_USERNAME}" --password "${LEARNER_PASSWORD}" --email "${LEARNER_EMAIL}" --must-change-password=false
+
+# ── Gitea OIDC provider wiring (Coder's login provider) ───────────────────────
+# Persist the Gitea admin creds (root-only) so C01's and C04's claim-time setups can PATCH
+# the learner's identity and publish the CI target-user secret using admin auth.
+umask 077
+printf 'GITEA_ADMIN_USERNAME=%s\nGITEA_ADMIN_PASSWORD=%s\n' "${GITEA_ADMIN_USERNAME}" "${GITEA_ADMIN_PASSWORD}" > /etc/coder/gitea-admin.cred
+
+# Register the OAuth2 application Coder uses as its OIDC client. Via cx (curl from inside the
+# coder container straight to gitea:3000), so Caddy's X-WEBAUTH-USER header is bypassed and
+# the gitadmin basic-auth applies. redirect_uri = Coder's PUBLIC OIDC callback.
+OAUTH_APP_RESP=$(jq -n --arg n "coder" --arg r "${CODER_ACCESS_URL}/api/v2/users/oidc/callback" \
+    '{name:$n, redirect_uris:[$r], confidential_client:true}' \
+  | cx -s -X POST "${GITEA_INT}/api/v1/user/applications/oauth2" \
+      -u "${GITEA_ADMIN_USERNAME}:${GITEA_ADMIN_PASSWORD}" -H "Content-Type: application/json" -d @-)
+OIDC_CLIENT_ID=$(echo "$OAUTH_APP_RESP" | jq -r '.client_id // empty')
+OIDC_CLIENT_SECRET=$(echo "$OAUTH_APP_RESP" | jq -r '.client_secret // empty')
+[ -z "$OIDC_CLIENT_ID" ] && echo "WARN: Gitea OAuth2 app registration failed; OIDC login unavailable. Response: ${OAUTH_APP_RESP}"
+
+# Issuer must match what Gitea advertises EXACTLY (trailing slash included). Read it from the
+# discovery doc rather than guessing. Gitea derives the issuer from ROOT_URL (the public URL),
+# so the value is correct even though we fetch discovery over the internal endpoint.
+OIDC_ISSUER=$(cx -s "${GITEA_INT}/.well-known/openid-configuration" | jq -r '.issuer // empty')
+[ -z "$OIDC_ISSUER" ] && OIDC_ISSUER="${GITEA_ACCESS_URL%/}"
+echo "OIDC issuer resolved to: ${OIDC_ISSUER}"
+
+# Write the OIDC env (the coder service's env_file target) and recreate coder to load it.
+# Password auth stays enabled (the provisioning admin uses it). email_verified is ignored
+# because Gitea may not mark a seeded account's email as verified. On first sign-in via
+# "Sign in with Gitea", Coder JIT-creates the user from these claims (ALLOW_SIGNUPS=true).
+if [ -n "$OIDC_CLIENT_ID" ] && [ -n "$OIDC_CLIENT_SECRET" ]; then
+  cat > /etc/coder/coder-oidc.env <<OIDCENV
+CODER_OIDC_ISSUER_URL=${OIDC_ISSUER}
+CODER_OIDC_CLIENT_ID=${OIDC_CLIENT_ID}
+CODER_OIDC_CLIENT_SECRET=${OIDC_CLIENT_SECRET}
+CODER_OIDC_SCOPES=openid,profile,email
+CODER_OIDC_ALLOW_SIGNUPS=true
+CODER_OIDC_USERNAME_FIELD=preferred_username
+CODER_OIDC_NAME_FIELD=name
+CODER_OIDC_EMAIL_FIELD=email
+CODER_OIDC_IGNORE_EMAIL_VERIFIED=true
+CODER_OIDC_SIGN_IN_TEXT=Sign in with Gitea
+CODER_DISABLE_PASSWORD_AUTH=false
+OIDCENV
+  docker compose up -d --force-recreate coder
+  wait_in_coder "${CODER_INT}/healthz" 120 4 || echo "WARN: coder OIDC recreate gate timed out; continuing."
+else
+  # Break-glass: OIDC could not be configured (OAuth2 app registration or issuer resolution
+  # failed, or the sandbox cannot reach its own public Gitea hostname). Without a fallback the
+  # lab is unusable, since the local learner account was removed in favor of OIDC. So restore
+  # a working local Coder login and surface its credentials, keeping the lab recoverable. This
+  # only runs on the OIDC failure path, so the OIDC-first happy path is unaffected.
+  echo "WARN: OIDC unavailable; provisioning a break-glass local learner account so sign-in still works."
+  BG_LEARNER_EMAIL="learner@workshop.local"
+  BG_LEARNER_USERNAME="learner"
+  BG_LEARNER_PASSWORD="Learner-$(date +%s | tail -c 6)!aA"
+  BG_RESP=$(cx -sS -w $'\n%{http_code}' -X POST "${CODER_INT}/api/v2/users" \
+    -H "Coder-Session-Token: ${CODER_ADMIN_TOKEN}" -H "Content-Type: application/json" \
+    -d "$(jq -n --arg e "$BG_LEARNER_EMAIL" --arg u "$BG_LEARNER_USERNAME" --arg p "$BG_LEARNER_PASSWORD" --arg o "$DEFAULT_ORG_ID" \
+          '{email:$e, username:$u, password:$p, login_type:"password", organization_ids:[$o]}')")
+  if [ "$(echo "$BG_RESP" | tail -n1)" = "201" ]; then
+    agent variable set CODER_USER_EMAIL "${BG_LEARNER_EMAIL}"
+    agent variable set CODER_USER_USERNAME "${BG_LEARNER_USERNAME}"
+    agent variable set CODER_USER_PASSWORD "${BG_LEARNER_PASSWORD}"
+    cat <<BGDIAG
+=== BREAK-GLASS LOGIN ACTIVE (OIDC unavailable) ===
+  "Sign in with Gitea" will not work. Direct the learner to sign in with:
+    Email:    ${BG_LEARNER_EMAIL}
+    Password: ${BG_LEARNER_PASSWORD}
+  Root cause is almost always the sandbox not reaching its own public Gitea hostname over
+  the OIDC back channel (see the OIDC issuer probe in the verification checklist).
+===================================================
+BGDIAG
+  else
+    echo "WARN: break-glass local learner creation failed: ${BG_RESP}. Lab may require manual login setup."
+  fi
+fi
+# ── end Gitea OIDC provider wiring ────────────────────────────────────────────
 
 printf '%s' '{"clone_addr":"https://github.com/coder-contrib/memory-card-ai-demo.git","repo_owner":"'"${LEARNER_USERNAME}"'","repo_name":"memory-card-ai-demo","mirror":false,"private":false,"description":"Memory Card Game — workshop repository"}' \
   | cx -s -X POST "${GITEA_INT}/api/v1/repos/migrate" -u "${LEARNER_USERNAME}:${LEARNER_PASSWORD}" -H "Content-Type: application/json" -d @- | head -c 200; echo
@@ -949,7 +1026,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CODER_URL: ${CODER_ACCESS_URL}
-      CODER_TARGET_USER_UUID: ${CODER_USER_ID}
+      CODER_TARGET_USER_UUID: ${{ secrets.CODER_TARGET_USER_UUID }}
       CODER_SESSION_TOKEN: ${{ secrets.CODER_SESSION_TOKEN }}
       CODER_ORG_ID: ${{ secrets.CODER_ORG_ID }}
       PROMPT: ${{ github.event.inputs.prompt }}
@@ -968,20 +1045,22 @@ jobs:
           CHAT_ID=$(echo "${RESPONSE}" | jq -r '.id')
           CHAT_URL="${CODER_URL}/agents/${CHAT_ID}"
 
-          CHAT_ACL_RESP=$(curl -sS -w $'\n%{http_code}' -X PATCH \
-            "${CODER_URL}/api/experimental/chats/${CHAT_ID}/acl" \
-            -H "Coder-Session-Token: ${CODER_SESSION_TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d "{\"user_roles\": {\"${CODER_TARGET_USER_UUID}\": \"read\"}}")
-          CHAT_ACL_HTTP=$(echo "${CHAT_ACL_RESP}" | tail -n1)
-          CHAT_ACL_BODY=$(echo "${CHAT_ACL_RESP}" | sed '$d')
-
-          if [ "${CHAT_ACL_HTTP}" != "204" ]; then
-            echo "Failed to share chat ${CHAT_ID} with ${TARGET_USER} (HTTP ${CHAT_ACL_HTTP}): ${CHAT_ACL_BODY}" >&2
-            exit 1
+          if [ -n "${CODER_TARGET_USER_UUID}" ]; then
+            CHAT_ACL_RESP=$(curl -sS -w $'\n%{http_code}' -X PATCH \
+              "${CODER_URL}/api/experimental/chats/${CHAT_ID}/acl" \
+              -H "Coder-Session-Token: ${CODER_SESSION_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "{\"user_roles\": {\"${CODER_TARGET_USER_UUID}\": \"read\"}}")
+            CHAT_ACL_HTTP=$(echo "${CHAT_ACL_RESP}" | tail -n1)
+            CHAT_ACL_BODY=$(echo "${CHAT_ACL_RESP}" | sed '$d')
+            if [ "${CHAT_ACL_HTTP}" = "204" ]; then
+              echo "Shared chat ${CHAT_ID} with ${CODER_TARGET_USER_UUID} (read)"
+            else
+              echo "WARN: could not share chat ${CHAT_ID} with ${CODER_TARGET_USER_UUID} (HTTP ${CHAT_ACL_HTTP}): ${CHAT_ACL_BODY}. The learner can still view it via the auditor role in C06." >&2
+            fi
+          else
+            echo "No CODER_TARGET_USER_UUID set; skipping chat share (learner views it via the auditor role in C06)."
           fi
-
-          echo "Shared chat ${CHAT_ID} with ${TARGET_USER} (read)"
 
           echo "Chat created: ${CHAT_URL}"
           echo "chat_url=${CHAT_URL}" >> "${GITHUB_OUTPUT}"
@@ -996,8 +1075,8 @@ jobs:
 WFEOF
 )
 
-export GITEA_ACCESS_URL LEARNER_USERNAME CODER_ACCESS_URL CODER_USER_ID
-WF_B64=$(echo "${WF_TEMPLATE}" | envsubst '${GITEA_ACCESS_URL} ${LEARNER_USERNAME} ${CODER_ACCESS_URL} ${CODER_USER_ID}' | base64 -w0)
+export GITEA_ACCESS_URL LEARNER_USERNAME CODER_ACCESS_URL
+WF_B64=$(echo "${WF_TEMPLATE}" | envsubst '${GITEA_ACCESS_URL} ${LEARNER_USERNAME} ${CODER_ACCESS_URL}' | base64 -w0)
 
 printf '%s' "$(jq -n --arg c "$WF_B64" '{message:"Add coder-agent CI workflow", content:$c, branch:"main"}')" \
   | cx -s -X POST "${GITEA_INT}/api/v1/repos/${LEARNER_USERNAME}/memory-card-ai-demo/contents/.gitea/workflows/coder-agent.yml" \
@@ -1024,7 +1103,7 @@ fi
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Surface URLs + (Gitea) creds to challenge bodies via [[ Instruqt-Var ]]
-# NOTE: no local-learner Coder creds — learners sign in with GitHub (device flow).
+# NOTE: no local-learner Coder creds — learners sign in via Gitea OIDC ("Sign in with Gitea").
 # ──────────────────────────────────────────────────────────────────────────────
 agent variable set SANDBOX_ID "${_SANDBOX_ID}"
 agent variable set CODER_URL "${CODER_ACCESS_URL}"
@@ -1038,9 +1117,6 @@ agent variable set GRAFANA_URL "${GRAFANA_ACCESS_URL}"
 agent variable set CODER_ADMIN_EMAIL "${CODER_ADMIN_EMAIL}"
 agent variable set CODER_ADMIN_USERNAME "${CODER_ADMIN_USERNAME}"
 agent variable set CODER_ADMIN_PASSWORD "${CODER_ADMIN_PASSWORD}"
-agent variable set CODER_USER_EMAIL "${CODER_USER_EMAIL}"
-agent variable set CODER_USER_USERNAME "${CODER_USER_USERNAME}"
-agent variable set CODER_USER_PASSWORD "${CODER_USER_PASSWORD}"
 
 echo "${CODER_ADMIN_TOKEN}" > /etc/coder/admin.token; chmod 600 /etc/coder/admin.token
 echo "########## setup-workshop: complete ##########"

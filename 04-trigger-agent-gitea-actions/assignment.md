@@ -81,7 +81,7 @@ The runner picks up the job in a container on the sandbox's Docker host and `cur
 A brand-new PR appears — from a **`ci/`-prefixed branch** (e.g. `ci/card-back-design`), opened by the **CI run**, not by you in the chat UI. From a single workflow dispatch, the agent provisioned a workspace, made the change, pushed the branch, and opened the PR. Behind that green check, the job called the **Coder Agents API** with a workshop-scoped CI token — the same governed endpoint the chat UI uses; a **pipeline**, not a person, kicked off the agent.
 
 > [!NOTE]
-> This run authenticates as a workshop **CI identity** — a machine, not your GitHub login. In **Challenge 6** you'll find this CI-triggered call in the AI Gateway audit, sitting right next to the prompts *you* ran by hand: human and machine activity, both governed and both attributed.
+> This run authenticates as a workshop **CI identity** — a machine, not your own identity. In **Challenge 6** you'll find this CI-triggered call in the AI Gateway audit, sitting right next to the prompts *you* ran by hand: human and machine activity, both governed and both attributed.
 
 ---
 

@@ -44,19 +44,10 @@ Your sandbox has spun up a complete, self-hosted Coder deployment: the control p
 
 <h2 style="color: #7511E2; font-weight: 500;">Step 1: Sign in to Coder</h2>
 
-Sign in by following the below instructions:
-
 1. Open the **Coder** tab (if it shows a brief loading page, give it a few seconds and refresh).
-2. Under **Email**, copy-paste in:
-```text,copy
-[[ Instruqt-Var key="CODER_USER_EMAIL" hostname="workshop" ]]
-```
-3. Under **Password** copy-paste in:
-```text,copy
-[[ Instruqt-Var key="CODER_USER_PASSWORD" hostname="workshop" ]]
-```
+2. Click **Sign in with Gitea**. If Gitea asks you to authorize the application, click **Authorize**.
 
-You're returned signed in as **your own Coder Admin** — which is what makes the audit trail in Challenge 6 a real "who did what."
+That's it. You land signed in as yourself. Coder uses the bundled Gitea as its login provider, so on first sign-in it creates your Coder account straight from your Gitea identity. Your real name and email ride along, which is what makes the audit trail in Challenge 6 a real "who did what" rather than a shared login.
 
 > [!NOTE]
 > Notice what you were *not* asked for: no model API key, no IDE extension, no agent CLI. Everything the agent needs lives server-side.

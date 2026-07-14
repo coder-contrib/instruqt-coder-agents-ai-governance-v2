@@ -12,7 +12,7 @@ notes:
       <svg viewBox="0 0 425.93 200" width="96" style="display:block;margin:0 auto 24px;" xmlns="http://www.w3.org/2000/svg"><g fill="#FFFFFF"><rect x="263.75" y="5.41" width="162.18" height="189.24"/><path d="M0,100C0,38.92,51.89,0,123.25,0s111.35,33.78,112.7,83.51l-61.62,1.89c-1.62-27.57-26.03-45.68-51.08-45.14-34.32.74-59.73,23.51-59.73,59.73s25.41,58.65,59.73,58.65c25.05,0,48.91-17.3,51.62-44.86l61.62,1.35c-1.62,50.54-44.05,84.87-113.24,84.87S0,160.81,0,100Z"/></g></svg>
       <div style="font-family:'Geist Mono',ui-monospace,Menlo,Consolas,monospace;font-size:12px;letter-spacing:0.04em;text-transform:uppercase;color:#A19CC8;margin-bottom:14px;">Challenge 06 &middot; AI Gateway audit</div>
       <div class="coder-blink" style="font-size:34px;font-weight:500;letter-spacing:-0.01em;line-height:1.12;margin-bottom:16px;">Every prompt. Audited.</div>
-      <div style="color:rgba(255,255,255,0.72);font-size:17px;max-width:560px;margin:0 auto;line-height:1.6;">Read the full audit trail — attributed to your GitHub identity — in Coder's AI Sessions and a Grafana dashboard.</div>
+      <div style="color:rgba(255,255,255,0.72);font-size:17px;max-width:560px;margin:0 auto;line-height:1.6;">Read the full audit trail — attributed to your real identity — in Coder's AI Sessions and a Grafana dashboard.</div>
     </div>
 tabs:
 - id: s1u9ykzgntd2
@@ -44,7 +44,7 @@ Everything you just did flowed through the **AI Gateway** — the controls layer
 
 In the **Coder** tab, open **Admin settings → AI Sessions** (the gateway's session list). Each row is one session:
 <img src="https://play.instruqt.com/assets/tracks/1sxii7ayovnx/7a1c5ac75e7caf3a5b9bf9b0def46dd2/assets/admin-ai-sesh.gif" width="200"></img>
-- **initiator** — your own GitHub identity, not a shared service account
+- **initiator** — your own identity (your real name and email), not a shared service account
 - **provider** — shown as the model vendor (e.g. **Anthropic**); every call still routes through the gateway to Bedrock
 - **client** (Coder Agents), last prompt, token usage, thread count, and tool-call count
 
@@ -66,7 +66,7 @@ Back on the AI Sessions list, use the filters to slice the audit trail:
 - by **model** (Claude Sonnet 4.6, Haiku 4.5, or gpt-oss-120b — two providers, one governed gateway)
 - plus free-text **search**, and a **Filters** toggle for **All sessions** vs **My sessions**
 
-Leave it on **All sessions** and notice you see *everyone's* activity — your own GitHub identity right beside the **CI service identity** from Challenge 4. Human and machine usage side by side, attributable to a specific initiator, is the auditor's whole job. In a real deployment with many developers and tools (Coder Agents plus Cursor, Claude Code, Codex…) pointed at the same gateway, this is how a platform team audits AI usage org-wide from one place.
+Leave it on **All sessions** and notice you see *everyone's* activity — your own identity right beside the **CI service identity** from Challenge 4. Human and machine usage side by side, attributable to a specific initiator, is the auditor's whole job. In a real deployment with many developers and tools (Coder Agents plus Cursor, Claude Code, Codex…) pointed at the same gateway, this is how a platform team audits AI usage org-wide from one place.
 
 ---
 
@@ -86,7 +86,7 @@ This is Coder's **official AI Gateway dashboard**, reading the audit tables dire
 - **interceptions over time**
 - a **prompts & tool-calls** detail table
 
-Every row is attributed to a real **GitHub username**, and you can filter by user, provider, model, and time.
+Every row is attributed to an initiator (your sign-in, and the CI identity from Challenge 4), and you can filter by user, provider, model, and time.
 
 > [!NOTE]
 > If a panel shows "No data," it just means the gateway hasn't recorded an interception attributable to your account yet. Send one quick prompt through the Agents chat (any prompt will do) and refresh the dashboard — your activity from Challenges 2–4 should already be there.
