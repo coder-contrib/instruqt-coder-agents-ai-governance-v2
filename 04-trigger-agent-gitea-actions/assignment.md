@@ -30,8 +30,6 @@ tabs:
   port: 80
 difficulty: intermediate
 timelimit: 0
-lab_config:
-  default_layout_sidebar_size: 0
 enhanced_loading: null
 ---
 
@@ -85,12 +83,14 @@ A brand-new PR appears — from a **`ci/`-prefixed branch** (e.g. `ci/card-back-
 
 ---
 
-<h2 style="color: #7511E2; font-weight: 500;">Step 4: Review the agent chat under the Coder Admin user</h2>
+<h2 style="color: #7511E2; font-weight: 500;">Step 4: Open the CI-triggered chat in Coder</h2>
+
+The workflow shared the chat it created with your account (read access), so you can open it in Coder even though a machine, not you, kicked it off.
 
 1. Open the **Gitea** tab.
 2. Click "Actions >> workflow run >> trigger-agent >> Show Chat URL"
-<img src="https://play.instruqt.com/assets/tracks/1sxii7ayovnx/4807d54d384b0795386f577b9e2468b2/assets/Gitea.gif" width="1000"></img>
-3. Click on the "Chat URL" to see the triggered agent chat in Coder (Admin User).
+<img src="../assets/Gitea.gif" width="1000"></img>
+3. Click the **Chat URL**. It opens in Coder, where the session shows it was initiated by the **CI identity** (`ci-bot`), not by you. That is exactly the human-vs-machine attribution you'll audit in Challenge 6.
 
 ---
 

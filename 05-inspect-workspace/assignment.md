@@ -30,8 +30,6 @@ tabs:
   port: 5173
 difficulty: intermediate
 timelimit: 0
-lab_config:
-  default_layout_sidebar_size: 0
 enhanced_loading: null
 ---
 
@@ -44,8 +42,8 @@ You've watched the agent ship a PR. Now prove the security claim by inspection. 
 <h2 style="color: #7511E2; font-weight: 500;">Step 1: Open a terminal in the workspace</h2>
 
 In the **Coder** tab, open your running workspace and launch its **Terminal**. You'll be inside the same container the agent operated in. Everything below runs there.
-![Screenshot 2026-06-18 at 11.48.38.png](https://play.instruqt.com/assets/tracks/1sxii7ayovnx/f3e43ffc4cdfb801bfa0920b2d4f51ec/assets/Screenshot%202026-06-18%20at%2011.48.38.png)
-<img src="https://play.instruqt.com/assets/tracks/1sxii7ayovnx/7084ff9ce6312b60621e3e344a085e7c/assets/workspace-terminal.gif" width="1000"></img>
+![Screenshot 2026-06-18 at 11.48.38.png](../assets/Screenshot%202026-06-18%20at%2011.48.38.png)
+<img src="../assets/workspace-terminal.gif" width="1000"></img>
 
 ---
 

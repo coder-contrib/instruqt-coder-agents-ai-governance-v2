@@ -36,8 +36,6 @@ tabs:
   port: 5173
 difficulty: intermediate
 timelimit: 0
-lab_config:
-  default_layout_sidebar_size: 0
 enhanced_loading: null
 ---
 
@@ -50,7 +48,7 @@ Now the agent does real work. You'll pick one of the seeded issues in your Gitea
 <h2 style="color: #7511E2; font-weight: 500;">Step 1: Start the application</h2>
 
 Let's start the app in the workspace and preview.  First, start a new chat, select Sonnet 4.6, then provide the following prompt.
-![Screenshot 2026-06-20 at 12.25.26.png](https://play.instruqt.com/assets/tracks/1sxii7ayovnx/dd232d5ecb918d9dd95a3019efdeb8db/assets/Screenshot%202026-06-20%20at%2012.25.26.png)
+![Screenshot 2026-06-20 at 12.25.26.png](../assets/Screenshot%202026-06-20%20at%2012.25.26.png)
 ```text,copy
 Clone the repo from [[ Instruqt-Var key="GITEA_REPO_URL" hostname="workshop" ]].git and run the application.
 ```

@@ -1,6 +1,5 @@
 slug: coder-agents-ai-governance-v2
 id: 9ksq81aifgxz
-revision: 1
 title: Coder Agents & AI Governance - v2 (In Progress)
 teaser: Drive a self-hosted coding agent from chat and from CI, prove the workspace
   holds no keys or agent binary, then audit every prompt, tool call, and token through
@@ -13,37 +12,36 @@ description: |
   In this workshop you will sign in to a fully self-hosted Coder deployment with your GitHub identity, ask an agent to scan a repository and list its issues without ever provisioning a workspace, then hand it a real issue and watch it implement, verify, commit, and open a pull request. You will trigger the same agent from CI, open the workspace yourself to confirm there are no AI credentials inside, and finally read the complete audit trail — attributed to your own identity — in both the Coder UI and a Grafana dashboard.
 
   Models are served directly from Amazon Bedrock, and the whole sandbox is ephemeral — spun up for you and destroyed when you finish, so nothing lingers afterward. By the end you will be able to explain, from first principles, where the AI actually lives and exactly what it can touch.
-icon: https://play.instruqt.com/assets/tracks/oat2lc0n3b5q/abe668d22ee2cc892e660dddb3caa014/assets/03_Coder_Shorthand_Logo_RGB_Black.svg
+icon: ./assets/03_Coder_Shorthand_Logo_RGB_Black.svg
 tags:
 - ai-gateway
-- ai-governance
-- bedrock
-- cde
-- coder
-- coder-agents
-- intermediate
 - product-education
+- cde
+- coder-agents
+- bedrock
+- intermediate
 - secure-by-default
+- coder
+- ai-governance
 owner: coder
 developers:
 - dave.ahr@coder.com
-instructors: []
 show_timer: true
 skipping_enabled: true
 idle_timeout: 3600
 timelimit: 7200
+pausable: true
+pausable_ttl: 604800
 lab_config:
-  extend_ttl: 0
   sidebar_enabled: true
-  hideStopButton: false
   feedback_recap_enabled: true
   feedback_tab_enabled: false
+  loadingMessages: true
   theme:
     name: modern-dark
   override_challenge_layout: false
+  hideStopButton: false
   default_layout: AssignmentRight
   default_layout_sidebar_size: 40
-  loadingMessages: true
-enhanced_loading: null
-pausable: true
-pausable_ttl: 604800
+checksum: "2082540863801449410"
+enhanced_loading: false

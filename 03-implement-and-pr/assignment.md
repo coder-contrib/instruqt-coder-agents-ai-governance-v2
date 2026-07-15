@@ -36,8 +36,6 @@ tabs:
   port: 5173
 difficulty: intermediate
 timelimit: 0
-lab_config:
-  default_layout_sidebar_size: 0
 enhanced_loading: null
 ---
 

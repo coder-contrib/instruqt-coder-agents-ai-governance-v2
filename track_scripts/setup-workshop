@@ -3,7 +3,7 @@
 # the approved "Coder Agents & AI Governance — Instruqt Track Build Plan").
 #
 # Stands up the full self-hosted stack on the workshop VM:
-#   Coder control plane v2.34.2 (Agents + AI Gateway / AI Governance, trial-licensed)
+#   Coder control plane v2.34.6 (Agents + AI Gateway / AI Governance, trial-licensed)
 #   Postgres (Coder state + AI Gateway audit tables: aibridge_*)
 #   Gitea (local "GitHub": repo clone + issues + PRs + Actions)
 #   act_runner (Gitea Actions runner, Docker mode — powers the C04 CI challenge)
@@ -321,7 +321,7 @@ services:
     restart: unless-stopped
 
   coder:
-    image: ghcr.io/coder/coder:v2.34.2
+    image: ghcr.io/coder/coder:v2.34.6
     depends_on: [postgres]
     # OIDC login config (Gitea as the identity provider) is written to this file AFTER
     # Gitea is up and the OAuth2 app exists, then coder is recreated to load it. The file
@@ -446,7 +446,7 @@ EOF
 # Pre-pull images in parallel (incl. act_runner + workspace base)
 # ──────────────────────────────────────────────────────────────────────────────
 echo "Pre-pulling images..."
-for img in postgres:16 ghcr.io/coder/coder:v2.34.2 gitea/gitea:latest gitea/act_runner:latest \
+for img in postgres:16 ghcr.io/coder/coder:v2.34.6 gitea/gitea:latest gitea/act_runner:latest \
            grafana/grafana:latest caddy:2 codercom/enterprise-base:ubuntu; do
   docker pull "$img" & done
 wait
@@ -694,11 +694,13 @@ resource "docker_container" "workspace" {
     read_only      = false
   }
   # App Preview: publish the in-workspace Vite dev server (5173) to the VM host so an
-  # Instruqt service tab can reach it. ONLY the learner's (non-admin) workspace publishes
-  # it: the C04 CI-triggered agent runs as 'admin' and must NOT also bind host:5173, or the
-  # two workspaces collide on the fixed port and the CI workspace fails to start (no PR).
+  # Instruqt service tab can reach it. ONLY the human learner's workspace publishes it. Any
+  # machine-owned workspace (the provisioning 'admin', and the C04 CI-triggered 'ci-bot')
+  # must NOT also bind host:5173, or the two workspaces collide on the fixed port and the
+  # second one fails to start with a terraform apply error (in C04 that means no PR). The
+  # CI workspace only opens a PR, so it never needs the preview port anyway.
   dynamic "ports" {
-    for_each = data.coder_workspace_owner.me.name == "admin" ? [] : [1]
+    for_each = contains(["admin", "ci-bot"], data.coder_workspace_owner.me.name) ? [] : [1]
     content {
       internal = 5173
       external = 5173

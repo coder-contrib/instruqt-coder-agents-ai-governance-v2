@@ -29,8 +29,6 @@ tabs:
   port: 3001
 difficulty: intermediate
 timelimit: 0
-lab_config:
-  default_layout_sidebar_size: 0
 enhanced_loading: null
 ---
 
@@ -43,7 +41,7 @@ Everything you just did flowed through the **AI Gateway** — the controls layer
 <h2 style="color: #7511E2; font-weight: 500;">Step 1: Open AI Sessions in Coder</h2>
 
 In the **Coder** tab, open **Admin settings → AI Sessions** (the gateway's session list). Each row is one session:
-<img src="https://play.instruqt.com/assets/tracks/1sxii7ayovnx/7a1c5ac75e7caf3a5b9bf9b0def46dd2/assets/admin-ai-sesh.gif" width="200"></img>
+<img src="../assets/admin-ai-sesh.gif" width="200"></img>
 - **initiator** — your own identity (your real name and email), not a shared service account
 - **provider** — shown as the model vendor (e.g. **Anthropic**); every call still routes through the gateway to Bedrock
 - **client** (Coder Agents), last prompt, token usage, thread count, and tool-call count

@@ -31,8 +31,6 @@ tabs:
   port: 8081
 difficulty: intermediate
 timelimit: 0
-lab_config:
-  default_layout_sidebar_size: 0
 enhanced_loading: null
 ---
 
@@ -55,11 +53,11 @@ That's it. You land signed in as yourself. Coder uses the bundled Gitea as its l
 
 <h2 style="color: #7511E2; font-weight: 500;">Step 2: Open the Agents chat and check the model dropdown</h2>
 
-1. After you sign in, your **Agents** access provisions automatically (a few seconds). If **Agents** isn't in the top navigation yet, refresh the Coder tab (upper right corner). ![Screenshot 2026-06-18 at 11.46.31.png](https://play.instruqt.com/assets/tracks/1sxii7ayovnx/34a10e6d0ab518425eb27b5955caebfe/assets/Screenshot%202026-06-18%20at%2011.46.31.png)
+1. After you sign in, your **Agents** access provisions automatically (a few seconds). If **Agents** isn't in the top navigation yet, refresh the Coder tab (upper right corner). ![Screenshot 2026-06-18 at 11.46.31.png](../assets/Screenshot%202026-06-18%20at%2011.46.31.png)
 2. Open the **Agents** view, then open the **model dropdown** at the top of the message box.
-<img src="https://play.instruqt.com/assets/tracks/1sxii7ayovnx/93acc8a5866df5b31790a5ab9050b0a7/assets/agents-tab.gif" width="500"></img>
+<img src="../assets/agents-tab.gif" width="500"></img>
 This deployment serves three models straight from Amazon Bedrock:
-![Screenshot 2026-06-18 at 11.50.58.png](https://play.instruqt.com/assets/tracks/1sxii7ayovnx/92902448f33dd425ee3bfa09e57595da/assets/Screenshot%202026-06-18%20at%2011.50.58.png)
+![Screenshot 2026-06-18 at 11.50.58.png](../assets/Screenshot%202026-06-18%20at%2011.50.58.png)
 | Model | Role |
 |-------|------|
 | **Claude Sonnet 4.6** | Quality — the default |
@@ -76,7 +74,7 @@ Switching models per prompt — two providers, governed centrally — is part of
 <h2 style="color: #7511E2; font-weight: 500;">Step 3: Ask a question that needs no workspace</h2>
 
 Switch to Haiku 4.5 and paste the below prompt into the Agents chat and send it:
-![Screenshot 2026-06-20 at 12.23.29.png](https://play.instruqt.com/assets/tracks/1sxii7ayovnx/a02efd7e5884219e31bfc1fb09eb2dda/assets/Screenshot%202026-06-20%20at%2012.23.29.png)
+![Screenshot 2026-06-20 at 12.23.29.png](../assets/Screenshot%202026-06-20%20at%2012.23.29.png)
 
 ```text,copy
 List the most poplular programming languages.
