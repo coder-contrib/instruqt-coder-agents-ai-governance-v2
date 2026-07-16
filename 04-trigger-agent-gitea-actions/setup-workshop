@@ -45,16 +45,17 @@ fi
 # ──────────────────────────────────────────────────────────────────────────────
 # Publish the CI chat's share target at claim time. The C04 workflow shares the chat it
 # creates with this Coder user (read) so the learner can open it from the run's Chat URL.
-# The learner's Coder user is JIT-created at C01 sign-in (username carries through from the
-# Gitea 'learner' account), so its UUID isn't known until now — resolve it and write it as
-# the Gitea Actions secret the workflow reads. If the learner hasn't signed in yet this is
-# skipped; the CI session is still visible to them via the auditor role in C06.
+# The learner's Coder user is JIT-created at C01 sign-in and its UUID isn't known until now.
+# NOTE: the learner's Coder USERNAME is derived from their name (e.g. "JohnSmith"), NOT the
+# Gitea 'learner' account name, so we resolve the single human user by excluding the machine
+# accounts (admin, ci-bot) rather than matching a fixed username. If the learner hasn't signed
+# in yet this is skipped; the CI session is still visible to them via the auditor role in C06.
 # ──────────────────────────────────────────────────────────────────────────────
 cx() { docker compose -f /etc/coder/docker-compose.yml exec -T coder curl "$@"; }
 . /etc/coder/gitea-admin.cred 2>/dev/null || echo "C04: gitea-admin.cred missing; CI share-target secret not set."
 if [ -n "${ADMIN_TOK:-}" ] && [ -n "${GITEA_ADMIN_USERNAME:-}" ]; then
   LEARNER_UUID=$(cx -s -H "Coder-Session-Token: ${ADMIN_TOK}" "http://localhost:7080/api/v2/users" 2>/dev/null \
-    | jq -r --arg u "$LEARNER_USERNAME" '[.users[]? | select(.username==$u)][0].id // empty' 2>/dev/null)
+    | jq -r '[.users[]? | select(.username != "admin" and .username != "ci-bot")][0].id // empty' 2>/dev/null)
   if [ -n "${LEARNER_UUID}" ]; then
     SEC_CODE=$(printf '%s' "$(jq -n --arg d "$LEARNER_UUID" '{data:$d}')" \
       | cx -s -o /dev/null -w "%{http_code}" -X PUT \

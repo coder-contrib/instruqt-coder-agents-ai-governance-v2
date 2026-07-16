@@ -69,7 +69,7 @@ Open the PR the agent created. It has three tabs across the top:
 - **Commits** — the commit on the feature branch, authored by **your** identity (carried through from the workspace).
 - **Files Changed** — the actual diff against the card-back rendering.
 
-You should see one **open** PR — from the agent's feature branch (e.g. `coder/card-back-diamond/…`) into **`main`**, opened by you. It's the same review experience your developers already know; the only difference is who wrote the code.
+You should see one **open** PR — from the agent's feature branch (e.g. `feature/add-countdown-timer…`) into **`main`**, opened by you. It's the same review experience your developers already know; the only difference is who wrote the code.
 
 > [!TIP]
 > Gitea's PR list doesn't auto-update — it's a static page until reloaded. If it looks empty, wait until the agent reports the PR is open, then click the **refresh icon** in the top-right of the lab window.

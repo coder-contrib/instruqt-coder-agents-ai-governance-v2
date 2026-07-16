@@ -27,35 +27,42 @@ fi
 # has claimed the sandbox (and consented to share details). We paint the participant's real
 # email + full name onto the Gitea 'learner' account; on first "Sign in with Gitea", Coder
 # JIT-creates the user from those OIDC claims, so the Coder identity carries the real name.
-# Consent-gated: if the email is absent (no consent / non-invite access), fall back cleanly.
+# The Coder USERNAME is derived from the name claim (CODER_OIDC_USERNAME_FIELD=name): Coder's
+# UsernameFrom() strips disallowed chars, so "John Smith" -> "JohnSmith".
+# Consent-gated: if the email is absent (no consent / non-invite access), we DON'T personalize —
+# the account keeps its default 'learner' name, so Coder derives the username 'learner'.
 # ──────────────────────────────────────────────────────────────────────────────
 PARTICIPANT_EMAIL="$(printenv INSTRUQT_USER_EMAIL 2>/dev/null || true)"
 PARTICIPANT_NAME="$(printenv INSTRUQT_USER_NAME 2>/dev/null || true)"
 CONSENT="$(printenv INSTRUQT_PRIVACY_POLICY_CONSENT 2>/dev/null || true)"
 
 if [ -z "${PARTICIPANT_EMAIL}" ]; then
-  echo "C01: no participant email (consent=${CONSENT:-unknown}); using a per-sandbox fallback identity."
-  PARTICIPANT_EMAIL="participant-${_SANDBOX_ID}@workshop.local"
-fi
-if [ -z "${PARTICIPANT_NAME}" ]; then
-  # Derive a presentable name from the email local-part: "jane.doe" -> "Jane Doe".
-  PARTICIPANT_NAME="$(printf '%s' "${PARTICIPANT_EMAIL%@*}" | tr '._-' '   ' \
-    | awk '{for(i=1;i<=NF;i++){$i=toupper(substr($i,1,1)) substr($i,2)}}1')"
-fi
-echo "C01: workshop identity -> ${PARTICIPANT_NAME} <${PARTICIPANT_EMAIL}>"
+  # No consent / non-invite access: do NOT invent a fallback identity. Leaving the Gitea
+  # 'learner' account untouched means its name claim stays 'learner', so Coder derives the
+  # default username 'learner' — exactly the intended fallback.
+  echo "C01: no participant email (consent=${CONSENT:-unknown}); keeping default 'learner' identity."
+else
+  if [ -z "${PARTICIPANT_NAME}" ]; then
+    # Details shared but name missing: derive a presentable name from the email local-part
+    # ("jane.doe" -> "Jane Doe"), which in turn yields a CamelCase Coder username ("JaneDoe").
+    PARTICIPANT_NAME="$(printf '%s' "${PARTICIPANT_EMAIL%@*}" | tr '._-' '   ' \
+      | awk '{for(i=1;i<=NF;i++){$i=toupper(substr($i,1,1)) substr($i,2)}}1')"
+  fi
+  echo "C01: workshop identity -> ${PARTICIPANT_NAME} <${PARTICIPANT_EMAIL}>"
 
-# PATCH the Gitea 'learner' account via the coder container (curl -> gitea:3000 direct),
-# bypassing Caddy's forced X-WEBAUTH-USER header so the gitadmin basic-auth applies.
-LEARNER_USERNAME="$(agent variable get GITEA_USERNAME 2>/dev/null || echo learner)"
-cx() { docker compose -f /etc/coder/docker-compose.yml exec -T coder curl "$@"; }
-. /etc/coder/gitea-admin.cred 2>/dev/null || echo "C01: gitea-admin.cred missing; identity not personalized."
-if [ -n "${GITEA_ADMIN_USERNAME:-}" ] && [ -n "${GITEA_ADMIN_PASSWORD:-}" ]; then
-  # login_name + source_id (0 = local) are sent for compatibility with older Gitea admin API.
-  PATCH_CODE=$(jq -n --arg e "$PARTICIPANT_EMAIL" --arg n "$PARTICIPANT_NAME" --arg ln "$LEARNER_USERNAME" \
-                '{email:$e, full_name:$n, login_name:$ln, source_id:0}' \
-    | cx -s -o /dev/null -w "%{http_code}" -X PATCH "http://gitea:3000/api/v1/admin/users/${LEARNER_USERNAME}" \
-          -u "${GITEA_ADMIN_USERNAME}:${GITEA_ADMIN_PASSWORD}" -H "Content-Type: application/json" -d @- 2>/dev/null)
-  echo "C01: personalized Gitea '${LEARNER_USERNAME}' (HTTP ${PATCH_CODE})"
+  # PATCH the Gitea 'learner' account via the coder container (curl -> gitea:3000 direct),
+  # bypassing Caddy's forced X-WEBAUTH-USER header so the gitadmin basic-auth applies.
+  LEARNER_USERNAME="$(agent variable get GITEA_USERNAME 2>/dev/null || echo learner)"
+  cx() { docker compose -f /etc/coder/docker-compose.yml exec -T coder curl "$@"; }
+  . /etc/coder/gitea-admin.cred 2>/dev/null || echo "C01: gitea-admin.cred missing; identity not personalized."
+  if [ -n "${GITEA_ADMIN_USERNAME:-}" ] && [ -n "${GITEA_ADMIN_PASSWORD:-}" ]; then
+    # login_name + source_id (0 = local) are sent for compatibility with older Gitea admin API.
+    PATCH_CODE=$(jq -n --arg e "$PARTICIPANT_EMAIL" --arg n "$PARTICIPANT_NAME" --arg ln "$LEARNER_USERNAME" \
+                  '{email:$e, full_name:$n, login_name:$ln, source_id:0}' \
+      | cx -s -o /dev/null -w "%{http_code}" -X PATCH "http://gitea:3000/api/v1/admin/users/${LEARNER_USERNAME}" \
+            -u "${GITEA_ADMIN_USERNAME}:${GITEA_ADMIN_PASSWORD}" -H "Content-Type: application/json" -d @- 2>/dev/null)
+    echo "C01: personalized Gitea '${LEARNER_USERNAME}' (HTTP ${PATCH_CODE})"
+  fi
 fi
 
 # Grant the non-owner learner(s) the read-only 'auditor' site role (per Jason 2026-06-17:
