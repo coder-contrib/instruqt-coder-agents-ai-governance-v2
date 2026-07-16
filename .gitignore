@@ -1,0 +1,4 @@
+# Local-only working files for the OIDC / Hot Start refactor.
+# These are review scratch and handoff notes, not part of the delivered track.
+HANDOFF-oidc-refactor.md
+claude-console-generated-files/

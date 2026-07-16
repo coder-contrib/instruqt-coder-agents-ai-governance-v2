@@ -31,8 +31,6 @@ tabs:
   port: 8081
 difficulty: intermediate
 timelimit: 0
-lab_config:
-  default_layout_sidebar_size: 0
 enhanced_loading: null
 ---
 
@@ -44,19 +42,10 @@ Your sandbox has spun up a complete, self-hosted Coder deployment: the control p
 
 <h2 style="color: #7511E2; font-weight: 500;">Step 1: Sign in to Coder</h2>
 
-Sign in by following the below instructions:
-
 1. Open the **Coder** tab (if it shows a brief loading page, give it a few seconds and refresh).
-2. Under **Email**, copy-paste in:
-```text,copy
-[[ Instruqt-Var key="CODER_USER_EMAIL" hostname="workshop" ]]
-```
-3. Under **Password** copy-paste in:
-```text,copy
-[[ Instruqt-Var key="CODER_USER_PASSWORD" hostname="workshop" ]]
-```
+2. Click **Sign in with Gitea**. If Gitea asks you to authorize the application, click **Authorize**.
 
-You're returned signed in as **your own Coder Admin** — which is what makes the audit trail in Challenge 6 a real "who did what."
+That's it. You land signed in as yourself. Coder uses the bundled Gitea as its login provider, so on first sign-in it creates your Coder account straight from your Gitea identity. Your real name and email ride along, which is what makes the audit trail in Challenge 6 a real "who did what" rather than a shared login.
 
 > [!NOTE]
 > Notice what you were *not* asked for: no model API key, no IDE extension, no agent CLI. Everything the agent needs lives server-side.
@@ -64,11 +53,11 @@ You're returned signed in as **your own Coder Admin** — which is what makes th
 
 <h2 style="color: #7511E2; font-weight: 500;">Step 2: Open the Agents chat and check the model dropdown</h2>
 
-1. After you sign in, your **Agents** access provisions automatically (a few seconds). If **Agents** isn't in the top navigation yet, refresh the Coder tab (upper right corner). ![Screenshot 2026-06-18 at 11.46.31.png](https://play.instruqt.com/assets/tracks/1sxii7ayovnx/34a10e6d0ab518425eb27b5955caebfe/assets/Screenshot%202026-06-18%20at%2011.46.31.png)
+1. After you sign in, your **Agents** access provisions automatically (a few seconds). If **Agents** isn't in the top navigation yet, refresh the Coder tab (upper right corner). ![Screenshot 2026-06-18 at 11.46.31.png](../assets/Screenshot%202026-06-18%20at%2011.46.31.png)
 2. Open the **Agents** view, then open the **model dropdown** at the top of the message box.
-<img src="https://play.instruqt.com/assets/tracks/1sxii7ayovnx/93acc8a5866df5b31790a5ab9050b0a7/assets/agents-tab.gif" width="500"></img>
+<img src="../assets/agents-tab.gif" width="500"></img>
 This deployment serves three models straight from Amazon Bedrock:
-![Screenshot 2026-06-18 at 11.50.58.png](https://play.instruqt.com/assets/tracks/1sxii7ayovnx/92902448f33dd425ee3bfa09e57595da/assets/Screenshot%202026-06-18%20at%2011.50.58.png)
+![Screenshot 2026-06-18 at 11.50.58.png](../assets/Screenshot%202026-06-18%20at%2011.50.58.png)
 | Model | Role |
 |-------|------|
 | **Claude Sonnet 4.6** | Quality — the default |
@@ -85,7 +74,7 @@ Switching models per prompt — two providers, governed centrally — is part of
 <h2 style="color: #7511E2; font-weight: 500;">Step 3: Ask a question that needs no workspace</h2>
 
 Switch to Haiku 4.5 and paste the below prompt into the Agents chat and send it:
-![Screenshot 2026-06-20 at 12.23.29.png](https://play.instruqt.com/assets/tracks/1sxii7ayovnx/a02efd7e5884219e31bfc1fb09eb2dda/assets/Screenshot%202026-06-20%20at%2012.23.29.png)
+![Screenshot 2026-06-20 at 12.23.29.png](../assets/Screenshot%202026-06-20%20at%2012.23.29.png)
 
 ```text,copy
 List the most poplular programming languages.

@@ -24,19 +24,20 @@ LOGIN_COUNT=$(echo "${AUDIT}" | jq '[.audit_logs[] | select(.action == "login" a
 if [ "${LOGIN_COUNT}" -gt 0 ] 2>/dev/null; then
   :
 else
-  fail-message "No successful login event recorded yet. In the Coder tab sign in with the provided username and password (Step 1) before clicking Check." || true
+  fail-message "No successful login event recorded yet. In the Coder tab, click the Sign in with Gitea button (Step 1) before clicking Check." || true
   exit 1
 fi
 
-# Belt-and-suspenders: ensure each signed-in (non-admin) GitHub user has the built-in
+# Belt-and-suspenders: ensure each signed-in (non-admin, non-ci-bot) user has the built-in
 # 'agents-access' org role (Agents UI + model dropdown) AND the read-only 'auditor' site
 # role (Admin settings -> AI Sessions) — even if the systemd reconciler hasn't caught them
 # yet. The Check button runs AFTER sign-in, so this is the reliable delivery path for C01,
 # whose per-challenge setup runs before the learner logs in. Idempotent.
 # NOTE: var is UID2, never UID (UID is a read-only bash builtin).
+USERS=$(curl -sS -H "Coder-Session-Token: ${CODER_ADMIN_TOKEN}" "${CODER_ACCESS_URL}/api/v2/users" 2>/dev/null || echo "")
 ORG_ID=$(curl -s -H "Coder-Session-Token: ${CODER_ADMIN_TOKEN}" "${CODER_ACCESS_URL}/api/v2/organizations" 2>/dev/null | jq -r '.[0].id' 2>/dev/null || echo "")
 if [ -n "${ORG_ID}" ] && [ "${ORG_ID}" != "null" ]; then
-  echo "${USERS}" | jq -r '.users[]? | select(.username != "admin") | .id' 2>/dev/null | while read -r UID2; do
+  echo "${USERS}" | jq -r '.users[]? | select(.username != "admin" and .username != "ci-bot") | .id' 2>/dev/null | while read -r UID2; do
     [ -z "${UID2}" ] && continue
     printf '%s' '{"roles": ["agents-access"]}' \
       | curl -s -o /dev/null -X PUT "${CODER_ACCESS_URL}/api/v2/organizations/${ORG_ID}/members/${UID2}/roles" \
@@ -47,5 +48,5 @@ if [ -n "${ORG_ID}" ] && [ "${ORG_ID}" != "null" ]; then
   done
 fi
 
-WHO=$(echo "${USERS}" | jq -r '[.users[]? | select(.username != "admin") | .username][0]' 2>/dev/null)
+WHO=$(echo "${USERS}" | jq -r '[.users[]? | select(.username != "admin" and .username != "ci-bot") | (.name // .username)][0]' 2>/dev/null)
 set-status "Signed in to Coder as ${WHO}. The agent answers without provisioning a workspace." 2>/dev/null || true

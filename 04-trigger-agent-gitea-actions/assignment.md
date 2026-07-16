@@ -30,8 +30,6 @@ tabs:
   port: 80
 difficulty: intermediate
 timelimit: 0
-lab_config:
-  default_layout_sidebar_size: 0
 enhanced_loading: null
 ---
 
@@ -81,16 +79,18 @@ The runner picks up the job in a container on the sandbox's Docker host and `cur
 A brand-new PR appears — from a **`ci/`-prefixed branch** (e.g. `ci/card-back-design`), opened by the **CI run**, not by you in the chat UI. From a single workflow dispatch, the agent provisioned a workspace, made the change, pushed the branch, and opened the PR. Behind that green check, the job called the **Coder Agents API** with a workshop-scoped CI token — the same governed endpoint the chat UI uses; a **pipeline**, not a person, kicked off the agent.
 
 > [!NOTE]
-> This run authenticates as a workshop **CI identity** — a machine, not your GitHub login. In **Challenge 6** you'll find this CI-triggered call in the AI Gateway audit, sitting right next to the prompts *you* ran by hand: human and machine activity, both governed and both attributed.
+> This run authenticates as a workshop **CI identity** — a machine, not your own identity. In **Challenge 6** you'll find this CI-triggered call in the AI Gateway audit, sitting right next to the prompts *you* ran by hand: human and machine activity, both governed and both attributed.
 
 ---
 
-<h2 style="color: #7511E2; font-weight: 500;">Step 4: Review the agent chat under the Coder Admin user</h2>
+<h2 style="color: #7511E2; font-weight: 500;">Step 4: Open the CI-triggered chat in Coder</h2>
+
+The workflow shared the chat it created with your account (read access), so you can open it in Coder even though a machine, not you, kicked it off.
 
 1. Open the **Gitea** tab.
 2. Click "Actions >> workflow run >> trigger-agent >> Show Chat URL"
-<img src="https://play.instruqt.com/assets/tracks/1sxii7ayovnx/4807d54d384b0795386f577b9e2468b2/assets/Gitea.gif" width="1000"></img>
-3. Click on the "Chat URL" to see the triggered agent chat in Coder (Admin User).
+<img src="../assets/Gitea.gif" width="1000"></img>
+3. Click the **Chat URL**. It opens in Coder, where the session shows it was initiated by the **CI identity** (`ci-bot`), not by you. That is exactly the human-vs-machine attribution you'll audit in Challenge 6.
 
 ---
 
