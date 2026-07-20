@@ -7,11 +7,11 @@ teaser: Drive a self-hosted coding agent from chat and from CI, prove the worksp
 description: |
   <b style="color:#7511E2;">Open by design. Secure by default.</b>
 
-  Coder Agents runs the entire agent loop in the Coder control plane — not in the developer's workspace. No LLM credentials, no Claude Code or Codex binary, no AI awareness inside the workspace at all. The AI Governance Add-On then sits in front of every model call: the AI Gateway centralizes provider credentials and records who ran which prompt, against which model, with which tool calls, at what cost.
+  Coder Agents runs the entire agent loop in the control plane — not the developer's workspace. No LLM credentials, no agent binary, no AI awareness inside the workspace. The AI Governance Add-On then sits in front of every model call, centralizing provider credentials and recording who ran which prompt, against which model, with which tool calls, at what cost.
 
-  In this workshop you will sign in to a fully self-hosted Coder deployment with your GitHub identity, ask an agent to scan a repository and list its issues without ever provisioning a workspace, then hand it a real issue and watch it implement, verify, commit, and open a pull request. You will trigger the same agent from CI, open the workspace yourself to confirm there are no AI credentials inside, and finally read the complete audit trail — attributed to your own identity — in both the Coder UI and a Grafana dashboard.
+  Sign in to a fully self-hosted Coder deployment with your own identity, ask an agent to scan a repository and list its issues without ever provisioning a workspace, then hand it a real issue and watch it implement, verify, commit, and open a pull request. Trigger the same agent from CI, open the workspace yourself to confirm there are no AI credentials inside, and read the complete audit trail — attributed to you — in both the Coder UI and a Grafana dashboard.
 
-  Models are served directly from Amazon Bedrock, and the whole sandbox is ephemeral — spun up for you and destroyed when you finish, so nothing lingers afterward. By the end you will be able to explain, from first principles, where the AI actually lives and exactly what it can touch.
+  Models are served directly from Amazon Bedrock, and the whole sandbox is ephemeral — spun up for you and destroyed when you finish. By the end you will be able to explain, from first principles, where the AI actually lives and exactly what it can touch.
 icon: ./assets/03_Coder_Shorthand_Logo_RGB_Black.svg
 tags:
 - ai-gateway
@@ -43,5 +43,5 @@ lab_config:
   hideStopButton: false
   default_layout: AssignmentRight
   default_layout_sidebar_size: 40
-checksum: "7571623747109075507"
+checksum: "17680930968050893535"
 enhanced_loading: false
